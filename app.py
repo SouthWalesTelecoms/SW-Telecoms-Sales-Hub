@@ -1,4 +1,5 @@
 import base64
+import gzip
 import hashlib
 import hmac
 import html as html_lib
@@ -4047,6 +4048,216 @@ class SentLog:
         raise RuntimeError("GitHub was busy saving the sent log. Please try again.")
 
 
+@st.cache_resource(show_spinner=False)
+def _shard_cache() -> Dict[str, Any]:
+    """Shared by every session on this server: {shard file name: (git sha, records)}. Only changed shards are re-downloaded."""
+    return {"shards": {}, "listed_at": 0.0}
+
+
+class ShardedStore:
+    """The customer list, split across SHARDS small gzipped JSON files in one folder of the data repo.
+
+    A list of ~30,000 customers is tens of MB as one file, so saving one call outcome would mean rewriting all of it.
+    Split up, a click rewrites one ~100 KB file, and loading only fetches files that changed since this server last
+    saw them. Same load() / apply() as SentLog, so the rest of the app doesn't care.
+    """
+    SHARDS = 64  # Never change once data is saved: it decides which file each customer lives in
+
+    def __init__(self, dir_secret: str = "GITHUB_CRM_DIR", default_dir: str = "customers",
+                 legacy: Optional["SentLog"] = None, local_dir: str = ".sales_hub_customers") -> None:
+        self.token = _secret_value("GITHUB_TOKEN")
+        self.repo = _secret_value("GITHUB_REPO")
+        self.branch = _secret_value("GITHUB_BRANCH", "main")
+        prefix = _secret_value("GITHUB_PATH_PREFIX", "sales-hub/").strip().lstrip("/")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        self.dir = (_secret_value(dir_secret) or (prefix + default_dir)).strip("/")
+        self.path = self.dir + "/"
+        self.backend = "github" if (self.token and self.repo) else "local"
+        self.legacy = legacy
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            base_dir = os.getcwd()
+        self.local_dir = os.path.join(base_dir, local_dir)
+        self.last_error: Optional[str] = None
+
+    # ---------- shared helpers ----------
+    @classmethod
+    def shard_of(cls, rid: str) -> str:
+        return f"s{int(hashlib.md5(str(rid).encode('utf-8')).hexdigest()[:8], 16) % cls.SHARDS:02d}.json.gz"
+
+    @staticmethod
+    def _pack(records: Dict[str, Any]) -> bytes:
+        return gzip.compress(json.dumps(records, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), 6)
+
+    @staticmethod
+    def _unpack(raw: bytes) -> Dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass  # Someone saved it uncompressed by hand
+        txt = raw.decode("utf-8-sig").strip()
+        if not txt or txt in ("[]", "null"):
+            return {}
+        data = json.loads(txt)
+        return data if isinstance(data, dict) else {}
+
+    def _headers(self, raw: bool = False) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github.raw+json" if raw else "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"}
+
+    def _api(self, tail: str) -> str:
+        return f"https://api.github.com/repos/{self.repo}/{tail}"
+
+    # ---------- GitHub ----------
+    def _list(self) -> Dict[str, str]:
+        """{file name: sha} of the shard files on GitHub (one API call)."""
+        resp = requests.get(self._api(f"contents/{self.dir}"), headers=self._headers(), params={"ref": self.branch},
+                            timeout=15)
+        if resp.status_code == 404:
+            return {}
+        if resp.status_code != 200:
+            raise RuntimeError(SentLog._describe(resp.status_code))
+        items = resp.json()
+        return {i["name"]: i["sha"] for i in items if isinstance(i, dict) and i.get("type") == "file"
+                and re.match(r"^s\d{2}\.json(\.gz)?$", i.get("name", ""))} if isinstance(items, list) else {}
+
+    def _blob(self, sha: str) -> bytes:
+        for attempt in range(3):
+            try:
+                resp = requests.get(self._api(f"git/blobs/{sha}"), headers=self._headers(raw=True), timeout=30)
+            except requests.exceptions.RequestException:
+                resp = None
+            if resp is not None and resp.status_code == 200:
+                return resp.content
+            if resp is not None and resp.status_code in (401, 403, 404):
+                break
+            time.sleep(1 + attempt)
+        raise RuntimeError(SentLog._describe(resp.status_code if resp is not None else 0)
+                           if resp is not None else "Couldn't reach GitHub to load the customer list.")
+
+    def _fetch(self, listing: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        cache = _shard_cache()["shards"]
+        need = [n for n, sha in listing.items() if (cache.get(n) or (None,))[0] != sha]
+        if need:
+            with ThreadPoolExecutor(max_workers=min(8, len(need))) as pool:
+                for name, raw in zip(need, pool.map(lambda n: self._blob(listing[n]), need)):
+                    cache[name] = (listing[name], self._unpack(raw))
+        for gone in [n for n in cache if n not in listing]:
+            cache.pop(gone, None)
+        return {n: cache[n][1] for n in listing}
+
+    def _put_shard(self, name: str, changes: Dict[str, Optional[Dict[str, Any]]], message: str) -> Dict[str, Any]:
+        cache = _shard_cache()["shards"]
+        url = self._api(f"contents/{self.dir}/{name}")
+        for _attempt in range(4):
+            resp = requests.get(url, headers=self._headers(), params={"ref": self.branch}, timeout=15)
+            if resp.status_code == 404:
+                sha, current = None, {}
+            elif resp.status_code == 200:
+                sha = resp.json().get("sha")
+                current = cache[name][1] if (cache.get(name) or (None,))[0] == sha else self._unpack(self._blob(sha))
+            else:
+                raise RuntimeError(SentLog._describe(resp.status_code))
+            merged = dict(current)
+            for k, v in changes.items():
+                if v is None:
+                    merged.pop(k, None)
+                else:
+                    merged[k] = v
+            body: Dict[str, Any] = {"message": message, "branch": self.branch,
+                                    "content": base64.b64encode(self._pack(merged)).decode("ascii")}
+            if sha:
+                body["sha"] = sha
+            put = requests.put(url, headers=self._headers(), json=body, timeout=60)
+            if put.status_code in (200, 201):
+                new_sha = ((put.json() or {}).get("content") or {}).get("sha")
+                if new_sha:
+                    cache[name] = (new_sha, merged)
+                return merged
+            if put.status_code not in (409, 422):  # 409/422: someone saved this file first, so re-read and retry
+                raise RuntimeError(SentLog._describe(put.status_code))
+            time.sleep(0.6 + _attempt)
+        raise RuntimeError("GitHub was busy saving. Please try again.")
+
+    # ---------- local (no GitHub set up: wiped when the app restarts) ----------
+    def _local_all(self) -> Dict[str, Dict[str, Any]]:
+        out = {}
+        if os.path.isdir(self.local_dir):
+            for n in os.listdir(self.local_dir):
+                if re.match(r"^s\d{2}\.json\.gz$", n):
+                    with open(os.path.join(self.local_dir, n), "rb") as fh:
+                        out[n] = self._unpack(fh.read())
+        return out
+
+    def _local_put(self, name: str, changes: Dict[str, Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+        os.makedirs(self.local_dir, exist_ok=True)
+        p = os.path.join(self.local_dir, name)
+        current = {}
+        if os.path.exists(p):
+            with open(p, "rb") as fh:
+                current = self._unpack(fh.read())
+        for k, v in changes.items():
+            if v is None:
+                current.pop(k, None)
+            else:
+                current[k] = v
+        with open(p + ".tmp", "wb") as fh:
+            fh.write(self._pack(current))
+        os.replace(p + ".tmp", p)
+        return current
+
+    # ---------- public ----------
+    def load(self) -> Dict[str, Any]:
+        self.last_error = None
+        try:
+            shards = self._fetch(self._list()) if self.backend == "github" else self._local_all()
+            data: Dict[str, Any] = {}
+            for recs in shards.values():
+                data.update(recs)
+            if not shards and self.legacy is not None:  # First run after the upgrade: move the old single file over
+                old = self.legacy.load()
+                old = {k: v for k, v in old.items() if isinstance(v, dict)}
+                if old:
+                    self.apply(old, "Sales Hub: moved the customer list into the split store")
+                    data = old
+            return data
+        except Exception as exc:
+            self.last_error = str(exc) if isinstance(exc, RuntimeError) else \
+                f"Couldn't load the customer list ({exc.__class__.__name__})."
+            return {}
+
+    def apply(self, changes: Dict[str, Optional[Dict[str, Any]]], message: str,
+              progress: Optional[Any] = None) -> Dict[str, Any]:
+        """Saves {id: record or None (= delete)}, touching only the files those ids live in. Returns the whole list."""
+        self.last_error = None
+        groups: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {}
+        for k, v in changes.items():
+            groups.setdefault(self.shard_of(k), {})[k] = v
+        names = sorted(groups)
+        for i, name in enumerate(names, start=1):
+            if self.backend == "github":
+                self._put_shard(name, groups[name], message if len(names) == 1 else f"{message} ({i}/{len(names)})")
+            else:
+                self._local_put(name, groups[name])
+            if progress:
+                progress(i, len(names))
+        if self.backend == "github":
+            cache = _shard_cache()["shards"]
+            data: Dict[str, Any] = {}
+            for _sha, recs in cache.values():
+                data.update(recs)
+            return data
+        data = {}
+        for recs in self._local_all().values():
+            data.update(recs)
+        return data
+
+
 def now_uk() -> datetime:
     try:
         return datetime.now(ZoneInfo("Europe/London"))
@@ -5648,10 +5859,11 @@ with st.sidebar:
             st.session_state["view"] = st.session_state["w_view"] = st.session_state.pop("_goto_view")
         if "view" not in st.session_state:
             st.session_state["view"] = st.query_params.get("view") if st.query_params.get("view") in (
-                "customers", "caller", "local", "overview", "prospect", "activity") else "caller"
+                "customers", "caller", "callbacks", "pipeline", "local", "overview", "prospect", "activity") else "caller"
         _n_to_call = 0
-        _views = {"caller": "📞  Caller", "customers": "📇  Customers", "local": "📍  Local hit list",
-                  "overview": "📈  Overview", "prospect": "🎯  Prospecting", "activity": "✉️  Email activity"}
+        _views = {"caller": "📞  Caller", "callbacks": "🗓  Call-backs", "customers": "📇  Customers",
+                  "pipeline": "💼  Pipeline", "overview": "📈  Overview", "local": "📍  Local hit list",
+                  "prospect": "🎯  Prospecting", "activity": "✉️  Email activity"}
         if st.session_state["view"] not in _views:
             st.session_state["view"] = "caller"
         if st.session_state.get("w_view") not in _views:
@@ -6540,11 +6752,15 @@ def render_quick_add() -> None:
 # ==========================================================================================
 import uuid as _uuid
 
-CRM_STORE = SentLog("GITHUB_CRM_PATH", "customers.json", ".sales_hub_customers.json", compact=True)
-PIPELINE = ["New", "No answer", "Call back", "Appointment", "Quoted", "Won", "Lost", "Not interested", "Do not call"]
-CLOSED = {"Won", "Lost", "Not interested", "Do not call"}
+CRM_STORE = ShardedStore(legacy=SentLog("GITHUB_CRM_PATH", "customers.json", ".sales_hub_customers.json", compact=True))
+PIPELINE = ["New", "No answer", "Call back", "Appointment", "Quoted", "Won", "Installed", "Lost", "Not interested",
+            "Do not call", "Bad number"]
+CLOSED = {"Won", "Installed", "Lost", "Not interested", "Do not call", "Bad number"}
 STATUS_TONE = {"New": "accent", "No answer": "", "Call back": "warn", "Appointment": "good", "Quoted": "good",
-               "Won": "good", "Lost": "muted", "Not interested": "muted", "Do not call": "risk"}
+               "Won": "good", "Installed": "good", "Lost": "muted", "Not interested": "muted", "Do not call": "risk",
+               "Bad number": "risk"}
+APPT_RESULTS = ["", "Sat – sold", "Sat – quoted / thinking", "Sat – not sold", "No show", "Cancelled"]
+SOLD = {"Won", "Installed"}
 CRM_FIELDS = [("company", "Company"), ("contact", "Contact name"), ("role", "Job title"), ("phone", "Phone"),
               ("mobile", "Mobile"), ("email", "Email"), ("website", "Website"), ("address", "Address"),
               ("town", "Town"), ("postcode", "Postcode"), ("sector", "Sector"), ("notes", "Notes")]
@@ -6577,14 +6793,23 @@ IMPORT_ALIASES: Dict[str, Tuple[str, ...]] = {
     "next_note": ("next action note", "next step"),
     "owner": ("owner", "account owner", "assigned to", "rep"),
     "company_number": ("company number", "company no", "companies house number", "crn"),
+    "handsets": ("handsets", "number of handsets", "no of handsets", "handset count", "extensions"),
+    "provider": ("current provider", "provider", "telecoms provider", "current supplier"),
+    "contract_end": ("contract end", "contract end date", "contract ends", "contract expiry"),
+    "next_time": ("next action time", "call back time", "callback time"),
 }
 # Columns our own download adds: ignored when that sheet comes back in (they're worked out live)
 EXPORT_ONLY_COLS = {"last call", "last outcome", "calls", "next appointment", "total contract value (£)", "emailed",
-                    "other emails", "source", "added"}
+                    "other emails", "source", "added", "credit band", "company status", "tps", "tps consent", "line type",
+                    "region", "county", "sic", "sic description", "lease asset", "lease market", "lease rental (£)",
+                    "rental frequency", "lease end", "lease supplier", "tags", "install date", "sold by", "staff",
+                    "credit rating", "head office phone"}
 IMPORT_LABELS = {"hub_id": "Hub ID (from a previous download)", "first_name": "First name", "last_name": "Last name",
                  "status": "Status", "next_action": "Next action date", "mrr": "Monthly value (£)",
                  "one_off": "One-off value (£)", "term": "Contract term (months)", "won_at": "Won on",
                  "next_note": "Next action note", "owner": "Owner", "company_number": "Company number",
+                 "handsets": "Handsets", "provider": "Current provider", "contract_end": "Contract end",
+                 "next_time": "Next action time",
                  **dict(CRM_FIELDS)}
 
 SH_CSS = """
@@ -6616,15 +6841,30 @@ div[class*="st-key-card-sh"] { background: linear-gradient(180deg, rgba(22,31,51
 # ---------------- Storage ----------------
 def crm_get() -> Dict[str, Any]:
     ss = st.session_state
-    if "crm_data" not in ss or ss.get("crm_data_epoch") != _log_epoch():
-        ss["crm_data"] = CRM_STORE.load()
+    # Re-checked every 45s (one cheap GitHub call; only files a colleague changed are downloaded again)
+    stale = time.time() - ss.get("crm_loaded_at", 0) > 45
+    if "crm_data" not in ss or ss.get("crm_data_epoch") != _log_epoch() or (stale and not ss.get("crm_hold")):
+        fresh = CRM_STORE.load()
+        if CRM_STORE.last_error:
+            ss["crm_load_failed"] = True
+            if ss.get("crm_data"):  # Keep what we had rather than showing an empty list
+                ss["crm_loaded_at"] = time.time()
+                ss["crm_error"] = CRM_STORE.last_error + " Showing the list as it was a moment ago."
+                return ss["crm_data"]
+        else:
+            ss.pop("crm_load_failed", None)
+        sig = (len(fresh), max((str(r.get("updated_at") or "") for r in fresh.values() if isinstance(r, dict)), default=""))
+        if "crm_data" in ss and sig != ss.get("crm_sig"):
+            ss["crm_ver"] = ss.get("crm_ver", 0) + 1  # A colleague changed something: redraw tables from the new list
+        ss["crm_data"], ss["crm_sig"] = fresh, sig
         ss["crm_data_epoch"] = _log_epoch()
+        ss["crm_loaded_at"] = time.time()
         if CRM_STORE.last_error:
             ss["crm_error"] = CRM_STORE.last_error
     return ss["crm_data"]
 
 
-def crm_save(changes: Dict[str, Optional[Dict[str, Any]]], message: str) -> None:
+def crm_save(changes: Dict[str, Optional[Dict[str, Any]]], message: str, progress: Optional[Any] = None) -> None:
     """Saves records (None deletes). Re-reads first, so two people working at once don't overwrite each other."""
     ss = st.session_state
     stamp = now_uk().isoformat(timespec="seconds")
@@ -6632,7 +6872,10 @@ def crm_save(changes: Dict[str, Optional[Dict[str, Any]]], message: str) -> None
         if rec is not None:
             rec["updated_at"] = stamp
     try:
-        ss["crm_data"] = CRM_STORE.apply(changes, f"Sales Hub: {message}")
+        ss["crm_data"] = CRM_STORE.apply(changes, f"Sales Hub: {message}", progress=progress)
+        ss["crm_loaded_at"] = time.time()
+        ss["crm_sig"] = (len(ss["crm_data"]), max((str(r.get("updated_at") or "") for r in ss["crm_data"].values()
+                                                   if isinstance(r, dict)), default=""))
     except Exception as exc:
         data = dict(ss.get("crm_data") or {})
         for k, v in changes.items():
@@ -6997,8 +7240,9 @@ def auto_map(columns: List[str]) -> Dict[str, Optional[str]]:
     used: Set[str] = set()
     for field, aliases in IMPORT_ALIASES.items():
         hit = next((c for c in columns if low[c] in aliases and c not in used), None)
-        if not hit and field not in ("contact", "status", "term", "notes"):
-            hit = next((c for c in columns if c not in used and any(a in low[c] for a in aliases if len(a) >= 5)), None)
+        if not hit and field not in ("contact", "status", "term", "notes", "provider", "contract_end", "handsets"):
+            hit = next((c for c in columns if c not in used and low[c] not in EXPORT_ONLY_COLS
+                        and any(a in low[c] for a in aliases if len(a) >= 5)), None)
         out[field] = hit
         if hit:
             used.add(hit)
@@ -7105,9 +7349,14 @@ def import_rows(df: pd.DataFrame, mapping: Dict[str, Optional[str]], source: str
         nd = to_date(row.get("next_action"))
         if nd and (overwrite or not rec.get("next_action")):
             rec["next_action"] = nd.isoformat()
-        for f in ("next_note", "owner", "company_number"):
+        for f in ("next_note", "owner", "company_number", "provider", "next_time"):
             if row.get(f) and (overwrite or not rec.get(f)):
                 rec[f] = row[f]
+        if row.get("handsets") and to_num(row["handsets"]) and (overwrite or not rec.get("handsets")):
+            rec["handsets"] = int(to_num(row["handsets"]))
+        ce_ = to_date(row.get("contract_end"))
+        if ce_ and (overwrite or not rec.get("contract_end")):
+            rec["contract_end"] = ce_.isoformat()
         if row.get("mrr") or row.get("one_off") or row.get("term") or row.get("won_at"):
             deal = dict(rec.get("deal") or {})
             for f in ("mrr", "one_off"):
@@ -7164,6 +7413,19 @@ def export_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
                "Total contract value (£)": tcv or "", "Won on": (r.get("deal") or {}).get("won_at", ""),
                "Emailed": "Yes" if f"crm:{r.get('id')}" in sent else "", "Owner": r.get("owner", ""),
                "Company number": r.get("company_number", ""), "Other emails": ", ".join(r.get("other_emails") or []),
+               "Head office phone": r.get("ho_phone", ""), "Handsets": r.get("handsets", ""),
+               "Current provider": r.get("provider", ""), "Contract end": r.get("contract_end", ""),
+               "Staff": r.get("employees", ""), "Credit rating": r.get("credit_rating", ""),
+               "Credit band": credit_band(r.get("credit_rating")), "Company status": r.get("company_status", ""),
+               "TPS": "Yes" if r.get("tps") else "", "TPS consent": "Yes" if r.get("tps_ok") else "",
+               "Line type": r.get("line_type", ""), "Region": r.get("region", ""), "County": r.get("county", ""),
+               "SIC": r.get("sic", ""), "SIC description": r.get("sic_desc", ""),
+               "Lease asset": r.get("lease_asset", ""), "Lease market": r.get("lease_market", ""),
+               "Lease rental (£)": r.get("lease_rental", ""), "Rental frequency": r.get("lease_freq", ""),
+               "Lease end": r.get("lease_end", ""), "Lease supplier": r.get("lease_supplier", ""),
+               "Tags": ", ".join(r.get("tags") or []), "Next action time": r.get("next_time", ""),
+               "Install date": (r.get("deal") or {}).get("install_date", ""),
+               "Sold by": (r.get("deal") or {}).get("won_by", ""),
                "Source": r.get("source", ""), "Added": str(r.get("created_at", ""))[:10]}
         for k in extra_cols:
             row[k] = (r.get("extra") or {}).get(k, "")
@@ -7201,10 +7463,371 @@ def read_upload(file) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
         return None, f"Couldn't read that file ({exc.__class__.__name__}). Save it as .csv or .xlsx and try again."
 
 
+# ---------------- Master data workbook (leasing list, "good credit" list, NOT Sold) ----------------
+# The SW Comms master sheet has ~80 columns. These importers keep the ones that help pick who to call
+# (staff numbers, credit, lease end and rental, phone system type, TPS flags) as proper fields you can filter on.
+NOT_TRADING_RE = re.compile(r"dissol|liquidat|administ|receiver|winding|removed|closed|converted|gazette|creditors",
+                            re.I)
+CREDIT_BANDS = [("A", 71, 100, "Very low risk"), ("B", 51, 70, "Low risk"), ("C", 30, 50, "Moderate risk"),
+                ("D", 21, 29, "High risk"), ("E", -999, 20, "Very high risk / not rated")]
+EMP_BANDS = [("1-4", 1, 4), ("5-9", 5, 9), ("10-19", 10, 19), ("20-49", 20, 49), ("50-99", 50, 99), ("100+", 100, 10 ** 9)]
+SMALL_WORDS = {"and", "of", "the", "for", "in", "on", "at", "to", "de"}
+KEEP_UPPER = {"UK", "LLP", "PLC", "CIC", "NHS", "GP", "IT", "ICT", "TV", "PR", "HR", "UPVC"}
+
+
+def tidy_name(text: Any) -> str:
+    """'WESTON PARK CARE LIMITED' -> 'Weston Park Care Limited' (leaves mixed-case names alone)."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    t = re.sub(r"\bLTD\.?$", "Ltd", t) if not t.isupper() else t
+    if not t or not t.isupper():
+        return t
+    out = []
+    for i, w in enumerate(t.split(" ")):
+        core = w.strip("().,&'")
+        if core == "LTD":
+            out.append("Ltd")
+        elif core in KEEP_UPPER or (len(core) <= 3 and core.isalpha() and not any(c in "AEIOU" for c in core)):
+            out.append(w)
+        elif i and w.lower() in SMALL_WORDS:
+            out.append(w.lower())
+        else:
+            out.append("-".join(re.sub(r"[A-Za-z]", lambda m: m.group(0).upper(), p.lower(), count=1)
+                                for p in w.split("-")))
+    return " ".join(out)
+
+
+UK_COUNTIES = {
+    "ABERDEENSHIRE", "ANGLESEY", "ISLE OF ANGLESEY", "ANGUS", "ARGYLL", "AVON", "AYRSHIRE", "BEDFORDSHIRE", "BERKSHIRE",
+    "BLAENAU GWENT", "BUCKINGHAMSHIRE", "BUCKS", "CAERPHILLY", "CAMBRIDGESHIRE", "CAMBS", "CARMARTHENSHIRE",
+    "CEREDIGION", "CHESHIRE", "CLEVELAND", "CLWYD", "CONWY", "CORNWALL", "COUNTY DURHAM", "CO DURHAM", "DURHAM",
+    "CUMBRIA", "DENBIGHSHIRE", "DERBYSHIRE", "DEVON", "DORSET", "DUMFRIESSHIRE", "DYFED", "EAST SUSSEX",
+    "EAST YORKSHIRE", "EAST RIDING OF YORKSHIRE", "ESSEX", "FIFE", "FLINTSHIRE", "GLAMORGAN", "MID GLAMORGAN",
+    "SOUTH GLAMORGAN", "WEST GLAMORGAN", "VALE OF GLAMORGAN", "GLOUCESTERSHIRE", "GLOS", "GREATER LONDON",
+    "GREATER MANCHESTER", "GWENT", "GWYNEDD", "HAMPSHIRE", "HANTS", "HEREFORDSHIRE", "HERTFORDSHIRE", "HERTS",
+    "ISLE OF WIGHT", "KENT", "LANARKSHIRE", "LANCASHIRE", "LANCS", "LEICESTERSHIRE", "LEICS", "LINCOLNSHIRE", "LINCS",
+    "LOTHIAN", "MERSEYSIDE", "MERTHYR TYDFIL", "MIDDLESEX", "MIDLOTHIAN", "MONMOUTHSHIRE", "NEATH PORT TALBOT",
+    "NORFOLK", "NORTH YORKSHIRE", "NORTHAMPTONSHIRE", "NORTHANTS", "NORTHUMBERLAND", "NOTTINGHAMSHIRE", "NOTTS",
+    "OXFORDSHIRE", "OXON", "PEMBROKESHIRE", "PERTHSHIRE", "POWYS", "RENFREWSHIRE", "RHONDDA CYNON TAF", "RUTLAND",
+    "SHROPSHIRE", "SOMERSET", "SOUTH YORKSHIRE", "STAFFORDSHIRE", "STAFFS", "STIRLINGSHIRE", "SUFFOLK", "SURREY",
+    "TORFAEN", "TYNE AND WEAR", "TYNE & WEAR", "WARWICKSHIRE", "WEST LOTHIAN", "WEST MIDLANDS", "WEST SUSSEX",
+    "WEST YORKSHIRE", "WILTSHIRE", "WILTS", "WORCESTERSHIRE", "WORCS", "WREXHAM", "COUNTY ANTRIM", "CO ANTRIM",
+    "COUNTY DOWN", "CO DOWN", "COUNTY TYRONE", "COUNTY ARMAGH", "COUNTY LONDONDERRY", "COUNTY FERMANAGH",
+}
+
+
+def _cell(v: Any) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s_ = str(v).strip()
+    return "" if s_.lower() in ("nan", "nat", "none", "unknown", "-1") else s_
+
+
+def fix_sheet_phone(v: Any) -> str:
+    """Excel drops the leading 0: '1743213007' -> '01743 213007'. Also '441915000000' and '1902855000.0'."""
+    d = re.sub(r"\D", "", re.sub(r"\.0$", "", _cell(v)))
+    if not d:
+        return ""
+    if d.startswith("44") and len(d) in (11, 12):
+        d = "0" + d[2:]
+    elif not d.startswith("0") and len(d) in (9, 10):
+        d = "0" + d
+    return normalise_uk_phone(d) or ""
+
+
+def fix_company_number(v: Any) -> str:
+    c = re.sub(r"\.0$", "", _cell(v)).upper().replace(" ", "")
+    if not c or c in ("0", "-1"):
+        return ""
+    return c.zfill(8) if c.isdigit() else c
+
+
+def credit_band(score: Any) -> str:
+    try:
+        n = int(float(score))
+    except (TypeError, ValueError):
+        return ""
+    if n < 0:
+        return ""
+    return next((b for b, lo, hi, _ in CREDIT_BANDS if lo <= n <= hi), "")
+
+
+def emp_band(n: Any) -> str:
+    try:
+        n = int(float(n))
+    except (TypeError, ValueError):
+        return "Unknown"
+    return next((b for b, lo, hi in EMP_BANDS if lo <= n <= hi), "Unknown")
+
+
+def _iso(v: Any) -> str:
+    d = to_date(_cell(v)) if _cell(v) else None
+    return d.isoformat() if d else ""
+
+
+def _num(v: Any) -> Optional[float]:
+    s_ = _cell(v)
+    if not s_:
+        return None
+    try:
+        return round(float(re.sub(r"[^\d.\-]", "", s_)), 2)
+    except ValueError:
+        return None
+
+
+def _int(v: Any) -> Optional[int]:
+    n = _num(v)
+    return int(n) if n is not None else None
+
+
+NOTE_DATE_RE = re.compile(r"[-–]\s*(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\s*$")
+
+
+def note_to_call(note: str, by: str = "Old sheet") -> Optional[Dict[str, Any]]:
+    """'Not in today, try Fri - 05.11' -> a call-history entry dated 5 Nov, so the old sheet's notes aren't lost."""
+    note = (note or "").strip()
+    if not note:
+        return None
+    m = NOTE_DATE_RE.search(note)
+    when = now_uk()
+    if m:
+        dd, mm, yy = int(m.group(1)), int(m.group(2)), m.group(3)
+        year = (2000 + int(yy) if len(yy) == 2 else int(yy)) if yy else now_uk().year
+        try:
+            when = datetime(year, mm, dd, 12, 0, tzinfo=UK_TZ)
+            if not yy and when > now_uk() + timedelta(days=2):
+                when = when.replace(year=year - 1)
+        except ValueError:
+            pass
+    return {"at": when.isoformat(timespec="seconds"), "by": by, "outcome": "Old sheet note",
+            "notes": NOTE_DATE_RE.sub("", note).strip(" -–") or note}
+
+
+def detect_master_sheet(df: pd.DataFrame) -> Optional[str]:
+    cols = {str(c).strip() for c in df.columns}
+    if {"CompanyName", "CompanyRegistrationNumber", "TelephoneNumber"} <= cols:
+        return "leasing"
+    if {"NumberRecorded", "CallOutcome", "CompanyName"} <= cols:
+        return "notsold"
+    if {"CompanyName", "TelephoneNumber", "DirectorFirstName"} <= cols:
+        return "shortlist"
+    return None
+
+
+MASTER_KIND_LABEL = {"leasing": "Leasing list (main data)", "shortlist": "Short list (tagged on the main data)",
+                     "notsold": "Previously worked leads (with their old outcome)"}
+
+
+def leasing_record(row: Dict[str, Any], source: str, stamp: str) -> Dict[str, Any]:
+    g = lambda k: _cell(row.get(k))  # noqa: E731
+    phone = fix_sheet_phone(row.get("TelephoneNumber"))
+    ho = fix_sheet_phone(row.get("HeadOfficeTelephoneNumber"))
+    a1, a2, a3, a4 = g("Address1"), g("Address2"), g("Address3"), g("Address4")
+    if a3 and not a4 and a3.upper() in UK_COUNTIES:  # 'Street, Ipswich, Suffolk': the county sits in line 3
+        a3, a4 = "", a3
+    town = a3 or a2
+    addr = ", ".join(x for x in (a1, a2 if a3 else "") if x)
+    contact = " ".join(tidy_name(x) for x in (g("DirectorFirstName"), g("DirectorSecondName")) if x)
+    status_txt = g("CompanyStatusDescription")
+    active = str(row.get("Active")).strip().lower() in ("true", "1", "yes")
+    credit = _int(row.get("CreditRating"))
+    sic = re.sub(r"\.0$", "", g("SIC"))
+    sic_desc = g("SICDescription").capitalize() if g("SICDescription") and g("SICDescription") != "UNCLASSIFIED" else ""
+    company = tidy_name(g("CompanyName"))
+    line = g("GROUP_LINE_TYPE")
+    rec: Dict[str, Any] = {
+        "company": company, "company_number": fix_company_number(row.get("CompanyRegistrationNumber")),
+        "contact": contact, "role": g("JobTitle"), "phone": phone if not phone.startswith("07") else "",
+        "mobile": phone if phone.startswith("07") else "", "ho_phone": ho if ho != phone else "",
+        "website": g("WebsiteLink"), "address": tidy_name(addr), "town": tidy_name(town),
+        "county": tidy_name(a4), "postcode": (g("AddressPostcode") or g("PostCode")).upper(),
+        "region": g("PostcodeTerritoryArea"), "sic": sic, "sic_desc": sic_desc,
+        "sector": sector_from_sic([sic]) or guess_sector(company, sic_desc),
+        "company_status": status_txt, "trading_ok": bool(active and not NOT_TRADING_RE.search(status_txt)),
+        "credit_rating": credit if credit is not None and credit >= 0 else None,
+        "credit_limit": _num(row.get("CreditLimit")), "employees": _int(row.get("Employees")),
+        "turnover": _num(row.get("Turnover")), "incorporated": _iso(row.get("IncorporationDate")),
+        "tps": g("TPSNotification").upper() == "Y", "ho_ctps": g("HeadOfficeTradingCTPSFlag").upper() == "Y",
+        "line_type": line if line not in ("Bad Numbers", "Wrong Details") else "",
+        "lease_end": _iso(row.get("Contract End Date")), "lease_rental": _num(row.get("Next Rental Amount")),
+        "lease_freq": g("Rental Frequency"), "lease_cost": _num(row.get("Original Equipment Cost")),
+        "lease_term": _int(row.get("Original Term")), "lease_asset": tidy_name(g("Asset Type")),
+        "lease_market": g("Market - UK View"), "lease_product": g("Commercial Product"),
+        "lease_supplier": g("'Portfolio$'[Group Name]"),
+        "tags": [], "source": source, "created_at": stamp,
+    }
+    if line in ("Bad Numbers", "Wrong Details"):
+        rec["tags"].append("Bad number on sheet")
+    if g("Unnamed: 39") == "1":
+        rec["tags"].append("Ticked on old sheet")
+    c = note_to_call(g("Unnamed: 80"))
+    rec["calls"] = [c] if c else []
+    return {k: v for k, v in rec.items() if v not in ("", None) or k in ("calls", "tags")}
+
+
+NOTSOLD_STATUS = [("notinterested", "Not interested"), ("wrong phone", "Bad number"), ("disconnected", "Bad number"),
+                  ("tps", "Do not call"), ("opt out", "Do not call"), ("callback", "Call back"),
+                  ("answer phone", "No answer"), ("out of office", "No answer")]
+
+
+def notsold_record(row: Dict[str, Any], source: str, stamp: str) -> Optional[Dict[str, Any]]:
+    g = lambda k: _cell(row.get(k))  # noqa: E731
+    if g("LRSDisposition") in ("Fake Lead",) or not (g("CompanyName") or g("NumberRecorded")):
+        return None
+    phone = fix_sheet_phone(row.get("NumberRecorded")) or fix_sheet_phone(row.get("LatestNumber"))
+    outcome = g("CallOutcome")
+    status = next((s_ for k, s_ in NOTSOLD_STATUS if k in outcome.lower()), "New")
+    tags = [t for t in (("Old outcome: " + outcome[:40]) if outcome else "",
+                        ("Old lead: " + g("LRSDisposition")) if g("LRSDisposition") not in ("", "Completed Survey") else "",
+                        "Was booked, not sold" if outcome.lower().startswith("booked") else "") if t]
+    calls = []
+    when = to_date(g("CallDateTime")[:10]) if g("CallDateTime") else None
+    if outcome and when:
+        calls.append({"at": datetime.combine(when, dt_time(12, 0), tzinfo=UK_TZ).isoformat(timespec="seconds"),
+                      "by": "Old sheet", "outcome": "Old sheet: " + outcome, "notes": g("CampaignGenerated")})
+    c = note_to_call(g("Unnamed: 23"))
+    if c:
+        calls.append(c)
+    rec = {"company": tidy_name(g("CompanyName")),
+           "company_number": fix_company_number(row.get("SoldReg") or row.get("LeadReg")),
+           "phone": phone if not phone.startswith("07") else "", "mobile": phone if phone.startswith("07") else "",
+           "postcode": g("PostCode").upper(), "credit_rating": _int(row.get("CreditRating")),
+           "incorporated": _iso(row.get("IncorporationDate")), "campaign": g("CampaignGenerated"),
+           "status": status, "next_action": now_uk().date().isoformat() if status == "Call back" else "",
+           "tags": tags, "calls": calls, "source": source, "created_at": stamp}
+    rec["sector"] = guess_sector(rec["company"])
+    return {k: v for k, v in rec.items() if v not in ("", None) or k in ("calls", "tags")}
+
+
+def merge_into(existing: Dict[str, Any], new: Dict[str, Any], overwrite: bool) -> Dict[str, Any]:
+    """Adds an imported row to a record that's already on the list. Call history and tags are always kept and added to;
+    status, next action and deals are never touched by an import."""
+    out = dict(existing)
+    for k, v in new.items():
+        if k in ("calls", "tags", "id", "status", "next_action", "created_at", "source", "deal", "appointments"):
+            continue
+        if v not in ("", None) and (overwrite or existing.get(k) in ("", None)):
+            out[k] = v
+    out["tags"] = list(dict.fromkeys(list(existing.get("tags") or []) + list(new.get("tags") or [])))
+    seen = {(c.get("at"), c.get("notes")) for c in calls_of(existing)}
+    out["calls"] = calls_of(existing) + [c for c in new.get("calls") or [] if (c.get("at"), c.get("notes")) not in seen]
+    return out
+
+
+def import_master(frames: List[Tuple[str, pd.DataFrame, str]], skip_closed: bool, overwrite: bool,
+                  progress: Optional[Any] = None) -> Dict[str, int]:
+    """frames: [(kind, dataframe, source label)]. The leasing list goes first so the others can match onto it."""
+    data = dict(crm_get())
+    idx = crm_index(data)
+    stamp = now_uk().isoformat(timespec="seconds")
+    who = crm_user()
+    stats = {"added": 0, "updated": 0, "skipped_closed": 0, "skipped": 0, "tagged": 0}
+    changes: Dict[str, Dict[str, Any]] = {}
+    added_ids: Set[str] = set()
+    order = {"leasing": 0, "notsold": 1, "shortlist": 2}
+    for kind, df, source in sorted(frames, key=lambda f: order.get(f[0], 9)):
+        df = df.where(pd.notna(df), None)
+        for row in df.to_dict("records"):
+            if kind == "shortlist":  # A hand-picked subset of the main list: tag the matching record
+                key = {"company": tidy_name(_cell(row.get("CompanyName"))),
+                       "postcode": _cell(row.get("AddressPostcode")).upper(),
+                       "phone": fix_sheet_phone(row.get("TelephoneNumber"))}
+                rid = find_match(key, data, idx)
+                if not rid:
+                    stats["skipped"] += 1
+                    continue
+                rec = dict(data[rid])
+                tag = source.split(":")[-1].strip() or "Short list"
+                if tag not in (rec.get("tags") or []):
+                    rec["tags"] = list(rec.get("tags") or []) + [tag]
+                    data[rid] = changes[rid] = rec
+                    stats["tagged"] += 1
+                continue
+            new = leasing_record(row, source, stamp) if kind == "leasing" else notsold_record(row, source, stamp)
+            if not new:
+                stats["skipped"] += 1
+                continue
+            if kind == "leasing" and skip_closed and not new.get("trading_ok"):
+                stats["skipped_closed"] += 1
+                continue
+            rid = find_match(new, data, idx)
+            if rid:
+                rec = merge_into(data[rid], new, overwrite)
+                if rid not in added_ids:
+                    stats["updated"] += rid not in changes
+            else:
+                rid = new_id()
+                rec = {"id": rid, "status": "New", "created_by": who, **new}
+                added_ids.add(rid)
+                stats["added"] += 1
+                for f_, key in (("num", str(rec.get("company_number") or "").upper()),
+                                ("email", (rec.get("email") or "").lower())):
+                    if key:
+                        idx[f_].setdefault(key, rid)
+                for p in (rec.get("phone"), rec.get("mobile")):
+                    if norm_phone(p or ""):
+                        idx["phone"].setdefault(norm_phone(p), rid)
+                co = norm_company(rec.get("company") or "")
+                if co:
+                    idx["co_pc"].setdefault(co + "|" + norm_pc(rec.get("postcode") or ""), rid)
+                    idx["co"].setdefault(co, rid)
+            rec["id"] = rid
+            data[rid] = changes[rid] = rec
+    if changes:
+        crm_save(changes, f"master data import: {stats['added']} added, {stats['updated']} updated", progress=progress)
+    return stats
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def read_workbook(raw: bytes) -> Dict[str, pd.DataFrame]:
+    try:
+        sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, dtype=str)
+    except Exception:
+        return {}
+    return {str(n): d.dropna(how="all") for n, d in sheets.items()}
+
+
+def render_master_import(fname: str, sheets: Dict[str, pd.DataFrame], master: Dict[str, Optional[str]]) -> None:
+    st.success("This looks like the SW Comms master data. Each tab is read with its own column matching, so staff"
+               " numbers, credit, lease end, rental, phone line type and TPS flags all become filters.")
+    picks = []
+    for name, df in sheets.items():
+        kind = master.get(name)
+        if not kind:
+            st.caption(f"⏭ {esc(name)}: not recognised, skipped ({len(df):,} rows).")
+            continue
+        on = st.checkbox(f"**{name}** · {len(df):,} rows · {MASTER_KIND_LABEL[kind]}", value=True, key=f"mi_{name}")
+        if on:
+            picks.append((kind, df, f"Master data: {name}"))
+    c1, c2 = st.columns([1.3, 1])
+    skip_closed = c1.toggle("Leave out dissolved / liquidated / closed companies", value=True, key="mi_skip")
+    overwrite = c2.radio("When a firm is already on the list", ["Only fill in blanks (safe)", "Update with the sheet's values"],
+                         key="mi_mode") == "Update with the sheet's values"
+    st.caption("Calls, statuses, call-backs, appointments and deals already logged are never changed by an import."
+               " Notes typed on the old sheet are added to each firm's call history.")
+    total = sum(len(d) for _, d, _ in picks)
+    if st.button(f"⬆️ Import {total:,} rows", type="primary", disabled=not picks, key="mi_go"):
+        bar = st.progress(0.0, text="Matching rows…")
+        st.session_state["crm_hold"] = True
+        try:
+            stats = import_master(picks, skip_closed, overwrite,
+                                  progress=lambda i, n: bar.progress(i / n, text=f"Saving… {i} of {n} files"))
+        finally:
+            st.session_state.pop("crm_hold", None)
+        bar.empty()
+        st.session_state["sh_flash"] = (
+            f"⬆️ Imported {esc(fname)}: <b>{stats['added']:,}</b> added, <b>{stats['updated']:,}</b> updated"
+            + (f", {stats['tagged']:,} tagged from the short list" if stats["tagged"] else "")
+            + (f", {stats['skipped_closed']:,} closed companies left out" if stats["skipped_closed"] else "")
+            + (f", {stats['skipped']:,} rows skipped (empty, fake or unmatched)" if stats["skipped"] else "") + ".")
+        st.session_state["sh_up_ver"] = st.session_state.get("sh_up_ver", 0) + 1
+        st.rerun()
+
+
 # ---------------- Calls, outcomes, deals ----------------
 def log_outcome(rid: str, outcome: str, notes: str = "", next_action: Optional[date] = None,
                 status: Optional[str] = None, appt: Optional[Dict[str, Any]] = None,
-                deal: Optional[Dict[str, Any]] = None, clear_next: bool = False) -> None:
+                deal: Optional[Dict[str, Any]] = None, clear_next: bool = False, next_time: str = "",
+                fields: Optional[Dict[str, Any]] = None) -> None:
     data = crm_get()
     if rid not in data:
         return
@@ -7215,45 +7838,52 @@ def log_outcome(rid: str, outcome: str, notes: str = "", next_action: Optional[d
         rec["status"] = status
     if next_action:
         rec["next_action"] = next_action.isoformat()
+        rec["next_time"] = next_time or ""
     elif clear_next:
-        rec["next_action"] = ""
+        rec["next_action"] = rec["next_time"] = ""
+    if fields:
+        rec.update({k: v for k, v in fields.items() if v not in (None, "")})
     if appt:
         rec["appointments"] = (rec.get("appointments") or []) + [dict(appt, booked_by=who, booked_at=stamp)]
     if deal:
-        rec["deal"] = dict(deal, won_by=deal.get("won_by") or who)
+        rec["deal"] = dict(rec.get("deal") or {}, **deal)
+        rec["deal"]["won_by"] = deal.get("won_by") or rec["deal"].get("won_by") or who
     if not rec.get("owner"):
         rec["owner"] = who
     crm_save({rid: rec}, f"{outcome}: {rec_label(rec)}")
 
 
-def caller_queue(data: Dict[str, Any], area: str = "", sectors: Optional[List[str]] = None,
-                 include_future: bool = False, statuses: Optional[List[str]] = None) -> List[str]:
-    today = now_uk().date()
-    area_n = area.strip().upper()
+def caller_queue(data: Dict[str, Any], seg: Optional[Dict[str, Any]] = None, include_future: bool = False,
+                 me: str = "") -> List[str]:
+    """Who to ring next: call-backs that are due (timed ones from 10 minutes before), then people never called,
+    then the rest. Closed records and booked-in appointments are left out."""
+    now = now_uk()
+    today = now.date()
+    seg = seg or SEG_DEFAULT
     out = []
     for rid, r in data.items():
         if not isinstance(r, dict):
             continue
         st_ = r.get("status") or "New"
-        if statuses and st_ not in statuses:
+        if seg.get("status"):
+            if st_ not in seg["status"]:
+                continue
+        elif st_ in CLOSED:
             continue
-        if not statuses and st_ in CLOSED:
+        if not (r.get("phone") or r.get("mobile") or r.get("ho_phone")):
             continue
-        if not (r.get("phone") or r.get("mobile")):
-            continue
-        if area_n and not (pc_district(r.get("postcode") or "") == area_n or norm_pc(r.get("postcode") or "").startswith(area_n)
-                           or area_n.lower() in (r.get("town") or "").lower()):
-            continue
-        if sectors and (r.get("sector") or rec_vertical(r)) not in sectors:
+        if not seg_match(r, seg, today, me):
             continue
         nd = to_date(r.get("next_action"))
-        if nd and nd > today and not include_future:
+        due = due_now(r, now)
+        if nd and not due and not include_future:
             continue
-        lc = last_call(r)
-        if st_ == "Appointment" and next_appt(r) and not nd:
+        if st_ == "Appointment" and next_appt(r) and not due:
             continue  # Booked in: nothing to call about until after the meeting
-        bucket = 0 if nd and nd <= today else (1 if not lc else 2)
-        out.append(((bucket, nd or today, (lc or {}).get("at", ""), (r.get("town") or "").lower(), rec_label(r).lower()), rid))
+        lc = last_call(r)
+        bucket = 0 if due else (1 if not lc or lc.get("by") == "Old sheet" else 2)
+        out.append(((bucket, nd or today, r.get("next_time") or "", (lc or {}).get("at", ""),
+                     (r.get("town") or "").lower(), rec_label(r).lower()), rid))
     return [rid for _, rid in sorted(out)]
 
 
@@ -7282,7 +7912,13 @@ def to_queue_for_email(rid: str) -> None:
 
 # ---------------- Shared bits of UI ----------------
 def sh_hero(title_html: str, sub: str, pills: List[Tuple[str, str, str]], eyebrow: str) -> None:
-    parts = [f'<div class="pe-step {cls}"><span class="num">{esc(n)}</span>{esc(lbl)}</div>' for n, lbl, cls in pills]
+    def _short(n: str) -> str:  # The pill circle fits ~3 characters: 22744 -> 23k
+        try:
+            v = int(str(n).replace(",", ""))
+        except ValueError:
+            return str(n)
+        return str(v) if v < 1000 else (f"{v / 1000:.1f}k" if v < 9950 else f"{round(v / 1000)}k")
+    parts = [f'<div class="pe-step {cls}"><span class="num">{esc(_short(n))}</span>{esc(lbl)}</div>' for n, lbl, cls in pills]
     render_html('<div class="pe-hero"><div>'
                 f'<div class="pe-eyebrow"><span class="dot"></span>{esc(eyebrow)}</div>'
                 f'<div class="pe-title">{title_html}</div><div class="pe-sub">{esc(sub)}</div>'
@@ -7342,8 +7978,9 @@ def record_card_html(r: Dict[str, Any]) -> str:
     if ap:
         meta.append(chip("📅 " + (_when(ap["at"]) or now_uk()).strftime("%a %d %b %H:%M"), "good"))
     mrr, one, term, tcv = deal_values(r)
-    if (r.get("status") == "Won") and (mrr or one):
+    if (r.get("status") in SOLD) and (mrr or one):
         meta.append(chip(f"{money(mrr)}/mo · {term or '?'} mths", "good"))
+    meta += facts_chips(r)
     lines = []
     who = " · ".join(x for x in (r.get("contact"), r.get("role")) if x)
     if who:
@@ -7357,6 +7994,7 @@ def record_card_html(r: Dict[str, Any]) -> str:
     if addr:
         maps = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(addr)
         lines.append(f'<div class="sh-line">📍 <a href="{esc(maps)}" target="_blank">{esc(addr)}</a></div>')
+    lines.append(lease_html(r) + company_facts_html(r))
     legal = r.get("trading_name") and r.get("company") and r["trading_name"] != r["company"]
     return (f'<div class="cl-firm">{esc(r.get("trading_name") or rec_label(r))}</div>'
             + (f'<div class="cl-legal">{esc(r["company"])}</div>' if legal else "")
@@ -7364,14 +8002,16 @@ def record_card_html(r: Dict[str, Any]) -> str:
 
 
 def phone_html(r: Dict[str, Any]) -> str:
-    nums = [p for p in (r.get("phone"), r.get("mobile")) if p]
+    nums = list(dict.fromkeys(p for p in (r.get("phone"), r.get("mobile"), r.get("ho_phone")) if p))
     if not nums:
         return '<div class="cl-phone"><div><div class="alt">No phone number yet: enrich it or add one.</div></div></div>'
     first, rest = nums[0], nums[1:]
     tel = lambda p: re.sub(r"[^\d+]", "", p)  # noqa: E731
     return (f'<div class="cl-phone"><div class="ic">{icon("phone", 20, 2.2)}</div><div>'
             f'<a href="tel:{tel(first)}">{esc(first)}</a>'
-            + "".join(f'<div class="alt">or <a style="font-size:.95rem" href="tel:{tel(p)}">{esc(p)}</a></div>' for p in rest)
+            + "".join(f'<div class="alt">or <a style="font-size:.95rem" href="tel:{tel(p)}">{esc(p)}</a>'
+                      + (' <span style="color:var(--faint)">(head office)</span>' if p == r.get("ho_phone") else "")
+                      + '</div>' for p in rest)
             + "</div></div>")
 
 
@@ -7395,10 +8035,14 @@ def deal_inputs(prefix: str, rec: Dict[str, Any]) -> Dict[str, Any]:
     t0 = int(to_num(d.get("term")) or 36)
     term = c3.selectbox("Contract term (months)", DEAL_TERMS + ([t0] if t0 not in DEAL_TERMS else []),
                         index=(DEAL_TERMS + ([t0] if t0 not in DEAL_TERMS else [])).index(t0), key=f"{prefix}_term")
-    won = st.date_input("Won on", value=to_date(d.get("won_at")) or now_uk().date(), format="DD/MM/YYYY",
+    c4, c5, c6 = st.columns(3)
+    won = c4.date_input("Sold on", value=to_date(d.get("won_at")) or now_uk().date(), format="DD/MM/YYYY",
                         key=f"{prefix}_won")
+    inst = c5.date_input("Install date", value=to_date(d.get("install_date")), format="DD/MM/YYYY", key=f"{prefix}_inst")
+    rep = rep_picker(c6, "Sold by", key=f"{prefix}_rep", value=d.get("won_by") or "")
     st.caption(f"Total contract value: **{money(mrr * term + one)}** ({money(mrr)} × {term} months + {money(one)}).")
-    return {"mrr": mrr, "one_off": one, "term": int(term), "won_at": won.isoformat()}
+    return {"mrr": mrr, "one_off": one, "term": int(term), "won_at": won.isoformat(),
+            "install_date": inst.isoformat() if inst else "", "won_by": rep}
 
 
 def goto_view(view: str) -> None:
@@ -7464,6 +8108,16 @@ def render_record_editor(rid: str) -> None:
                 else:
                     vals[f] = cols[i % 2].text_input(lbl, value=r.get(f) or "")
             vals["notes"] = st.text_area("Notes", value=r.get("notes") or "", height=90)
+            render_html('<div class="sh-section">Phone system</div>')
+            q1, q2, q3, q4 = st.columns(4)
+            hs = q1.number_input("Handsets", min_value=0, step=1, value=int(to_num(r.get("handsets")) or 0))
+            prov = q2.text_input("Current provider", value=r.get("provider") or "")
+            ce = q3.date_input("Their contract ends", value=to_date(r.get("contract_end")), format="DD/MM/YYYY")
+            ho = q4.text_input("Head office phone", value=r.get("ho_phone") or "")
+            t1_, t2_ = st.columns([3, 1])
+            tags_in = t1_.text_input("Tags (comma separated)", value=", ".join(r.get("tags") or []),
+                                     placeholder="e.g. Hot, Ring after Christmas")
+            tps_ok = t2_.checkbox("OK to call (TPS consent)", value=bool(r.get("tps_ok")), disabled=not r.get("tps"))
             render_html('<div class="sh-section">Pipeline</div>')
             p1, p2, p3 = st.columns(3)
             status = p1.selectbox("Status", PIPELINE, index=PIPELINE.index(r.get("status") or "New")
@@ -7472,8 +8126,23 @@ def render_record_editor(rid: str) -> None:
             owner = p3.text_input("Owner", value=r.get("owner") or "")
             next_note = st.text_input("Next action note", value=r.get("next_note") or "",
                                       placeholder="e.g. Send quote for 6 handsets")
-            render_html('<div class="sh-section">Deal (when won)</div>')
+            render_html('<div class="sh-section">Deal (when sold)</div>')
             deal = deal_inputs(f"ed_deal_{rid}_{ver}", r)
+            facts = [(lbl, r.get(k)) for k, lbl in (
+                ("company_status", "Company status"), ("credit_rating", "Credit score"), ("credit_limit", "Credit limit (£)"),
+                ("employees", "Staff"), ("turnover", "Turnover (£)"), ("sic_desc", "Business activity"), ("sic", "SIC"),
+                ("incorporated", "Incorporated"), ("region", "Region"), ("county", "County"), ("line_type", "Phone lines"),
+                ("lease_asset", "Leased asset"), ("lease_market", "Lease market"), ("lease_product", "Lease product"),
+                ("lease_rental", "Lease rental (£)"), ("lease_freq", "Rental frequency"), ("lease_cost", "Equipment cost (£)"),
+                ("lease_term", "Lease term (months)"), ("lease_end", "Lease end"), ("lease_supplier", "Lease via"),
+                ("campaign", "Old campaign"), ("reg_address", "Registered office"), ("officers", "Officers"),
+                ("former_contact", "Previous contact"), ("ch_checked_at", "Checked at Companies House"),
+                ("source", "Came from")) if r.get(k) not in (None, "", [])]
+            if facts:
+                with st.expander(f"Company & lease data ({len(facts)})"):
+                    fc = st.columns(2)
+                    for i_, (lbl, v) in enumerate(facts):
+                        fc[i_ % 2].markdown(f"**{esc(lbl)}:** {esc(', '.join(v) if isinstance(v, list) else v)}")
             if r.get("extra"):
                 with st.expander(f"Other columns from the upload ({len(r['extra'])})"):
                     for k, v in r["extra"].items():
@@ -7481,8 +8150,15 @@ def render_record_editor(rid: str) -> None:
             saved = st.form_submit_button("💾 Save changes", type="primary")
         if saved:
             new = {**r, **{k: (v.strip() if isinstance(v, str) else v) for k, v in vals.items()}, "status": status,
-                   "next_action": nd.isoformat() if nd else "", "owner": owner.strip(), "next_note": next_note.strip()}
-            if status == "Won" or deal["mrr"] or deal["one_off"]:
+                   "next_action": nd.isoformat() if nd else "", "owner": owner.strip(), "next_note": next_note.strip(),
+                   "handsets": int(hs) or "", "provider": prov.strip(), "contract_end": ce.isoformat() if ce else "",
+                   "ho_phone": normalise_uk_phone(ho) or ho.strip(), "tps_ok": bool(tps_ok),
+                   "tags": [t.strip() for t in tags_in.split(",") if t.strip()]}
+            if not nd:
+                new["next_time"] = ""
+            if status == "Installed" and not (r.get("deal") or {}).get("installed_at"):
+                deal["installed_at"] = deal.get("install_date") or now_uk().date().isoformat()
+            if status in SOLD or deal["mrr"] or deal["one_off"]:
                 new["deal"] = dict(r.get("deal") or {}, **deal)
             if status != (r.get("status") or "New"):
                 new["calls"] = calls_of(r) + [{"at": now_uk().isoformat(timespec="seconds"), "by": crm_user(),
@@ -7524,6 +8200,10 @@ def add_customer_form() -> None:
 
 
 def render_import_box() -> None:
+    if st.session_state.get("crm_load_failed"):
+        st.error("The customer list didn't load from GitHub, so uploads are paused (importing now could create"
+                 " duplicates). Reload the page in a minute.")
+        return
     with st.expander("⬆️ Upload a customer list (CSV or Excel)", expanded=not crm_get()):
         st.caption("Your sheet becomes the customer list. Any headings work: we match the usual ones (Company, Contact,"
                    " Phone, Email, Postcode…) and keep every other column too. Re-upload a sheet you downloaded from"
@@ -7532,6 +8212,13 @@ def render_import_box() -> None:
                               label_visibility="collapsed")
         if not up:
             return
+        if (up.name or "").lower().endswith((".xlsx", ".xlsm", ".xls")):
+            with st.spinner("Reading the workbook (big sheets take up to a minute)…"):
+                sheets = read_workbook(up.getvalue())
+            master = {n: detect_master_sheet(d) for n, d in sheets.items()}
+            if any(master.values()):
+                render_master_import(up.name, sheets, master)
+                return
         df, err = read_upload(up)
         if err or df is None:
             st.error(err or "Couldn't read that file.")
@@ -7572,10 +8259,10 @@ def render_customers_page() -> None:
     recs = [r for r in data.values() if isinstance(r, dict)]
     today = now_uk().date()
     due = sum(1 for r in recs if (to_date(r.get("next_action")) or date.max) <= today and (r.get("status") or "New") not in CLOSED)
-    won = [r for r in recs if r.get("status") == "Won"]
+    won = [r for r in recs if r.get("status") in SOLD]
     sh_hero('Customer <span>list</span>', "Your customers and prospects in one place: upload your sheet, enrich it,"
             " work it, and download it any time.",
-            [(f"{len(recs):,}", "On the list", "active"), (f"{due:,}", "Due a call", ""), (f"{len(won):,}", "Won", "done")],
+            [(f"{len(recs):,}", "On the list", "active"), (f"{due:,}", "Due a call", ""), (f"{len(won):,}", "Sold", "done")],
             "Stand-alone CRM · saved for the whole team")
     flash()
     show_crm_error()
@@ -7586,54 +8273,40 @@ def render_customers_page() -> None:
         return
     with st.container(key="card-sh-list"):
         section_header("01", "Customers", "Search and filter, tick rows for bulk actions, or tick one to open it.")
-        f1, f2, f3, f4 = st.columns([1.6, 1.2, 1, 1])
-        q = f1.text_input("Search", key="cu_q", placeholder="Company, contact, phone, email, town…").strip().lower()
-        stf = f2.multiselect("Status", PIPELINE, key="cu_status", placeholder="Any status")
-        area = f3.text_input("Area", key="cu_area", placeholder="e.g. CF10 or Newport").strip()
-        sectors = sorted({r.get("sector") for r in recs if r.get("sector")})
-        sec = f4.multiselect("Sector", sectors, key="cu_sector", placeholder="Any")
-        g1, g2, g3 = st.columns(3)
-        only_due = g1.toggle("Only due a call", key="cu_due")
-        no_contact = g2.toggle("Missing email or phone", key="cu_gaps")
-        g3.caption("")
-        view = []
-        for r in recs:
-            st_ = r.get("status") or "New"
-            if stf and st_ not in stf:
-                continue
-            if sec and r.get("sector") not in sec:
-                continue
-            if area:
-                a_ = area.upper().replace(" ", "")
-                if not (norm_pc(r.get("postcode") or "").startswith(a_) or area.lower() in (r.get("town") or "").lower()):
-                    continue
-            if only_due and not ((to_date(r.get("next_action")) or date.max) <= today and st_ not in CLOSED):
-                continue
-            if no_contact and (r.get("email") and (r.get("phone") or r.get("mobile"))):
-                continue
-            if q:
-                hay = " ".join(str(r.get(k) or "") for k in ("company", "trading_name", "contact", "phone", "mobile",
-                                                             "email", "town", "postcode", "notes", "sector")).lower()
-                if q not in hay and _n(q) not in _n(hay):
-                    continue
-            view.append(r)
+        seg = render_segment_filters("cu", defaults={"tps": TPS_OPTS[1]})
+        only_due = st.toggle("Only due a call", key="cu_due")
+        now_ = now_uk()
+        me = crm_user()
+        view = [r for r in recs if seg_match(r, seg, today, me) and (not only_due or (
+            due_now(r, now_) and (r.get("status") or "New") not in CLOSED))]
         view.sort(key=lambda r: (to_date(r.get("next_action")) or date.max, rec_label(r).lower()))
         sent = get_sent_log()
         df = pd.DataFrame([{
-            "id": r["id"], "Company": rec_label(r), "Contact": r.get("contact") or "", "Phone": r.get("phone") or r.get("mobile") or "",
+            "id": r["id"], "Company": rec_label(r), "Contact": r.get("contact") or "",
+            "Phone": r.get("phone") or r.get("mobile") or r.get("ho_phone") or "",
             "Email": r.get("email") or "", "Town": r.get("town") or "", "Postcode": r.get("postcode") or "",
             "Status": r.get("status") or "New", "Next action": to_date(r.get("next_action")),
             "Last call": ((_when((last_call(r) or {}).get("at")) or None)),
+            "Staff": r.get("employees"), "Handsets": int(to_num(r.get("handsets")) or 0) or None,
+            "Credit": credit_band(r.get("credit_rating")), "Lease/contract end": end_date_of(r),
+            "Equipment": r.get("lease_asset") or "", "TPS": "⛔" if is_tps(r) else "",
             "Emailed": "✓" if f"crm:{r['id']}" in sent else "", "Sector": r.get("sector") or "",
         } for r in view], columns=["id", "Company", "Contact", "Phone", "Email", "Town", "Postcode", "Status",
-                                   "Next action", "Last call", "Emailed", "Sector"])
+                                   "Next action", "Last call", "Staff", "Handsets", "Credit", "Lease/contract end",
+                                   "Equipment", "TPS", "Emailed", "Sector"])
         if not df.empty:
             df["Last call"] = pd.to_datetime(df["Last call"], errors="coerce", utc=True).dt.tz_convert("Europe/London").dt.tz_localize(None)
         st.caption(f"Showing {len(view):,} of {len(recs):,}.")
         common = dict(hide_index=True, selection_mode="multi-row", on_select="rerun",
-                      column_order=["Company", "Contact", "Phone", "Email", "Town", "Postcode", "Status", "Next action",
-                                    "Last call", "Emailed", "Sector"],
+                      column_order=["Company", "Contact", "Phone", "Town", "Postcode", "Status", "Next action",
+                                    "Staff", "Handsets", "Credit", "Lease/contract end", "Equipment", "TPS", "Last call",
+                                    "Email", "Emailed", "Sector"],
                       column_config={"Next action": st.column_config.DateColumn("Next action", format="ddd D MMM"),
+                                     "Lease/contract end": st.column_config.DateColumn("Lease/contract end", format="MMM YYYY"),
+                                     "Staff": st.column_config.NumberColumn("Staff", width=60),
+                                     "Handsets": st.column_config.NumberColumn("Handsets", width=70),
+                                     "Credit": st.column_config.TextColumn("Credit", width=50),
+                                     "TPS": st.column_config.TextColumn("TPS", width=40),
                                      "Last call": st.column_config.DatetimeColumn("Last call", format="D MMM HH:mm"),
                                      "Emailed": st.column_config.TextColumn("✉️", width=40)},
                       height=min(38 + 35 * max(len(df), 1), 480), key=f"cu_tbl_{st.session_state.get('crm_ver', 0)}")
@@ -7643,7 +8316,17 @@ def render_customers_page() -> None:
             ev = st.dataframe(df, use_container_width=True, **common)
         sel_rows = [i for i in (ev.selection.rows if ev else []) if i < len(view)]
         sel = [view[i]["id"] for i in sel_rows]
-        b1, b2, b3, b4 = st.columns(4)
+        b1, b5, b2, b3, b4 = st.columns(5)
+        ch_targets = (sel or [r["id"] for r in view])[:CH_BATCH]
+        if b5.button(f"🏛 Check {len(ch_targets)} at Companies House", disabled=not view, **FULL_WIDTH,
+                     help=f"Free: checks each firm is still trading and updates its address, officers and sector."
+                          f" Uses the ones you've ticked, or the first {CH_BATCH} shown. Records checked in the last"
+                          f" 30 days are skipped."):
+            n, closed, fails = ch_cleanse(ch_targets)
+            st.session_state["sh_flash"] = (f"🏛 Checked {n} at Companies House" + (f": {closed} no longer trading"
+                                            " (marked, and left out of the Caller)" if closed else ": all still trading")
+                                            + "." + (f" {fails} not found." if fails else ""))
+            st.rerun()
         if b1.button(f"✨ Enrich {len(sel) or ''} selected".replace("  ", " "), disabled=not sel, **FULL_WIDTH,
                      help=f"Up to {MAX_BATCH} at a time. Fills blanks only."):
             n, fails = enrich_records(sel)
@@ -7666,15 +8349,22 @@ def render_customers_page() -> None:
             st.session_state["caller_focus"] = sel
             open_in_caller(sel[0])
             st.rerun()
-        exp = export_df(view)
-        xl = to_xlsx(exp)
         stamp = now_uk().strftime("%Y-%m-%d")
-        if xl:
-            b4.download_button("⬇️ Download (Excel)", xl, file_name=f"{BRAND_FILE}_customers_{stamp}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", **FULL_WIDTH)
+        dl_sig = (len(view), st.session_state.get("crm_ver", 0), seg_summary(seg))
+        if st.session_state.get("cu_dl_sig") != dl_sig:
+            if b4.button(f"⬇️ Prepare download ({len(view):,})", **FULL_WIDTH,
+                         help="Builds an Excel file of what's shown. Big lists take a few seconds."):
+                with st.spinner("Building the spreadsheet…"):
+                    exp = export_df(view)
+                    xl = to_xlsx(exp) if len(view) <= 40000 else None
+                    st.session_state["cu_dl"] = (xl, "xlsx") if xl else (exp.to_csv(index=False).encode("utf-8-sig"), "csv")
+                    st.session_state["cu_dl_sig"] = dl_sig
+                st.rerun()
         else:
-            b4.download_button("⬇️ Download (CSV)", exp.to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"{BRAND_FILE}_customers_{stamp}.csv", mime="text/csv", **FULL_WIDTH)
+            blob, ext = st.session_state["cu_dl"]
+            b4.download_button(f"⬇️ Download ({ext.upper()})", blob, file_name=f"{BRAND_FILE}_customers_{stamp}.{ext}",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if ext == "xlsx"
+                               else "text/csv", **FULL_WIDTH)
         st.caption("The download is what's shown (filters applied), with every original column. Edit it in Excel and"
                    " upload it again to update the list.")
     if len(sel) == 1:
@@ -7691,15 +8381,14 @@ def render_caller_page() -> None:
     today = now_uk().date()
     if not name_gate():
         return
-    with st.expander("🎛 Who to call", expanded=False):
-        c1, c2, c3 = st.columns([1, 1.4, 1])
-        area = c1.text_input("Area (postcode or town)", key="ca_area", placeholder="e.g. CF10 or Swansea")
-        sectors = sorted({r.get("sector") for r in data.values() if isinstance(r, dict) and r.get("sector")})
-        sec = c2.multiselect("Sector", sectors, key="ca_sector", placeholder="Any sector")
-        fut = c3.toggle("Include future call-backs", key="ca_future")
+    with st.expander("🎛 Who to call: " + seg_summary(seg_from_state("ca")) +
+                     (f" · group: {ss['ca_group']}" if ss.get("ca_group") else ""), expanded=False):
+        seg = render_segment_filters("ca", show_status=False)
+        fut = st.toggle("Include call-backs that aren't due yet", key="ca_future")
     focus = [r for r in (ss.get("caller_focus") or []) if r in data]
-    order = focus or caller_queue(data, area, sec, fut)
-    due_n = sum(1 for rid in order if (to_date(data[rid].get("next_action")) or date.max) <= today)
+    order = focus or caller_queue(data, seg, fut, crm_user())
+    now_ = now_uk()
+    due_n = sum(1 for rid in order if due_now(data[rid], now_))
     calls_today = sum(1 for r in data.values() if isinstance(r, dict) for c in calls_of(r)
                       if str(c.get("at", "")).startswith(today.isoformat()) and c.get("by") == crm_user()
                       and c.get("outcome") not in ("Note", "Edited", "Status changed"))
@@ -7711,6 +8400,14 @@ def render_caller_page() -> None:
              (str(appts_today), "Booked today", "done")], f"Calling as {crm_user()}")
     flash()
     show_crm_error()
+    later = sorted((r.get("next_time"), r) for r in data.values() if isinstance(r, dict) and r.get("next_time")
+                   and to_date(r.get("next_action")) == today and not due_now(r, now_)
+                   and (r.get("status") or "New") not in CLOSED)
+    if later:
+        t_, r_ = later[0]
+        st.caption(f"⏰ Next timed call-back: **{t_}** {esc(rec_label(r_))}"
+                   + (f" (+{len(later) - 1} more later today)" if len(later) > 1 else "")
+                   + ". It joins the top of the list 10 minutes before.")
     if focus:
         st.info(f"Calling the {len(focus)} customer(s) you picked.")
         if st.button("Back to the full call list", key="ca_unfocus"):
@@ -7748,33 +8445,64 @@ def render_caller_page() -> None:
                 with st.expander("More from the customer sheet"):
                     for k, v in list(r["extra"].items())[:30]:
                         st.markdown(f"**{esc(k)}:** {esc(v)}")
+            if is_tps(r):
+                st.warning("⛔ This number is on the TPS/CTPS register. Don't make an unsolicited sales call to it"
+                           " unless they've agreed to hear from you. Tick 'OK to call' in the details below if they have.")
             notes = st.text_area("Notes from this call", key=f"ca_notes_{rid}", height=80,
                                  placeholder="Who you spoke to, what they said…")
+            with st.expander("📝 What you found out: handsets, provider, contract end, contact",
+                             expanded=not (r.get("handsets") or r.get("provider"))):
+                k1, k2, k3 = st.columns(3)
+                hs = k1.number_input("Handsets", min_value=0, step=1, value=int(to_num(r.get("handsets")) or 0),
+                                     key=f"ca_hs_{rid}")
+                prov = k2.text_input("Current provider", value=r.get("provider") or "", key=f"ca_prov_{rid}",
+                                     placeholder="e.g. BT, Daisy")
+                ce = k3.date_input("Their contract ends", value=to_date(r.get("contract_end")), format="DD/MM/YYYY",
+                                   key=f"ca_ce_{rid}")
+                k4, k5, k6 = st.columns(3)
+                dm = k4.text_input("Decision maker", value=r.get("contact") or "", key=f"ca_dm_{rid}")
+                em = k5.text_input("Email", value=r.get("email") or "", key=f"ca_emv_{rid}")
+                ok_call = k6.checkbox("TPS: OK to call", value=bool(r.get("tps_ok")), key=f"ca_tpsok_{rid}",
+                                      disabled=not r.get("tps"))
+                if st.button("💾 Save details", key=f"ca_det_{rid}"):
+                    latest = crm_get().get(rid) or r
+                    upd = {**latest, "handsets": int(hs) or "", "provider": prov.strip(),
+                           "contract_end": ce.isoformat() if ce else "", "contact": dm.strip() or latest.get("contact", ""),
+                           "email": em.strip() or latest.get("email", ""), "tps_ok": bool(ok_call)}
+                    crm_save({rid: upd}, f"details for {rec_label(r)}")
+                    ss["sh_flash"] = f"💾 Saved details for {esc(rec_label(r))}."
+                    ss["caller_pin"] = True
+                    st.rerun()
+            learned = {"handsets": int(hs) or None, "provider": prov.strip() or None,
+                       "contract_end": ce.isoformat() if ce else None}
             render_html('<div class="sh-section">One click: outcome & next action</div>')
             nwd = next_working_day(today)
             o1, o2, o3 = st.columns(3)
             if o1.button("📵 No answer", key=f"ca_na_{rid}", **FULL_WIDTH, help=f"Try again {nwd.strftime('%a %d %b')}"):
-                log_outcome(rid, "No answer", notes, next_action=nwd, status="No answer" if r.get("status") in (None, "", "New", "No answer") else None)
+                log_outcome(rid, "No answer", notes, fields=learned, next_action=nwd, status="No answer" if r.get("status") in (None, "", "New", "No answer") else None)
                 ss["sh_flash"] = f"📵 No answer from {esc(rec_label(r))}: back on the list {nwd.strftime('%a %d %b')}."
                 ss["caller_rid"] = None
                 st.rerun()
             if o2.button("🔁 Tomorrow", key=f"ca_cb1_{rid}", **FULL_WIDTH, help=f"Call back {nwd.strftime('%a %d %b')}"):
-                log_outcome(rid, "Call back", notes, next_action=nwd, status="Call back")
+                log_outcome(rid, "Call back", notes, next_action=nwd, status="Call back", fields=learned)
                 ss["sh_flash"] = f"🔁 Call back {esc(rec_label(r))} on {nwd.strftime('%a %d %b')}."
                 ss["caller_rid"] = None
                 st.rerun()
             nxt_week = today + timedelta(days=(7 - today.weekday()) or 7)
             if o3.button("🔁 Next week", key=f"ca_cb7_{rid}", **FULL_WIDTH, help=f"Call back {nxt_week.strftime('%a %d %b')}"):
-                log_outcome(rid, "Call back", notes, next_action=nxt_week, status="Call back")
+                log_outcome(rid, "Call back", notes, next_action=nxt_week, status="Call back", fields=learned)
                 ss["sh_flash"] = f"🔁 Call back {esc(rec_label(r))} on {nxt_week.strftime('%a %d %b')}."
                 ss["caller_rid"] = None
                 st.rerun()
-            d1, d2 = st.columns([1, 1])
+            d1, d0, d2 = st.columns([1, 0.7, 1.1])
             cb_date = d1.date_input("Call back on", value=next_working_day(today, 2), min_value=today,
                                     format="DD/MM/YYYY", key=f"ca_cbd_{rid}")
-            if d2.button("🔁 Call back on that date", key=f"ca_cbx_{rid}", **FULL_WIDTH):
-                log_outcome(rid, "Call back", notes, next_action=cb_date, status="Call back")
-                ss["sh_flash"] = f"🔁 Call back {esc(rec_label(r))} on {cb_date.strftime('%a %d %b')}."
+            cb_time = d0.selectbox("At", TIME_SLOTS, key=f"ca_cbt_{rid}", format_func=lambda t: t or "Any time")
+            if d2.button("🔁 Call back then", key=f"ca_cbx_{rid}", **FULL_WIDTH):
+                log_outcome(rid, "Call back", notes, next_action=cb_date, status="Call back", next_time=cb_time,
+                            fields=learned)
+                ss["sh_flash"] = f"🔁 Call back {esc(rec_label(r))} on {cb_date.strftime('%a %d %b')}" + \
+                    (f" at {cb_time}." if cb_time else ".")
                 ss["caller_rid"] = None
                 st.rerun()
             render_html('<div class="sh-section">Appointment booked</div>')
@@ -7783,11 +8511,14 @@ def render_caller_page() -> None:
                                      key=f"ca_apd_{rid}")
             ap_time = ap2.time_input("Time", value=dt_time(10, 0), step=900, key=f"ca_apt_{rid}")
             ap_kind = ap3.selectbox("Type", ["On site visit", "Phone call", "Video call", "At our office"], key=f"ca_apk_{rid}")
-            ap_with = st.text_input("Meeting with", value=r.get("contact") or "", key=f"ca_apw_{rid}")
+            aw1, aw2 = st.columns(2)
+            ap_with = aw1.text_input("Meeting with", value=r.get("contact") or "", key=f"ca_apw_{rid}")
+            ap_rep = rep_picker(aw2, "Sales rep going", key=f"ca_aprep_{rid}")
             if st.button("📅 Appointment booked", key=f"ca_ap_{rid}", type="primary", **FULL_WIDTH):
                 at = datetime.combine(ap_date, ap_time).replace(tzinfo=UK_TZ).isoformat(timespec="minutes")
-                log_outcome(rid, "Appointment booked", notes, next_action=ap_date, status="Appointment",
-                            appt={"at": at, "kind": ap_kind, "with": ap_with.strip(), "notes": notes.strip()})
+                log_outcome(rid, "Appointment booked", notes, next_action=ap_date, status="Appointment", fields=learned,
+                            appt={"at": at, "kind": ap_kind, "with": ap_with.strip(), "notes": notes.strip(),
+                                  "rep": ap_rep})
                 area_ = pc_district(r.get("postcode") or "") or (r.get("town") or "")
                 ss["sh_flash"] = (f"📅 Booked: {esc(rec_label(r))}, {ap_date.strftime('%a %d %b')} at"
                                   f" {ap_time.strftime('%H:%M')} ({esc(ap_kind.lower())}).")
@@ -7796,20 +8527,36 @@ def render_caller_page() -> None:
                 ss["caller_rid"] = None
                 st.rerun()
             render_html('<div class="sh-section">Other outcomes</div>')
-            x1, x2, x3, x4 = st.columns(4)
+            y1, y2 = st.columns(2)
+            if y1.button("📆 In contract: call before it ends", key=f"ca_inc_{rid}", **FULL_WIDTH,
+                         disabled=not ce, help="Fill in 'Their contract ends' above first. We'll call back 3 months before."):
+                back = max(next_working_day(today, 5), ce - timedelta(days=90))
+                log_outcome(rid, "In contract", notes, next_action=back, status="Call back", fields=learned)
+                ss["sh_flash"] = (f"📆 {esc(rec_label(r))} is in contract until {ce.strftime('%b %Y')}: back on the"
+                                  f" list {back.strftime('%a %d %b %Y')}.")
+                ss["caller_rid"] = None
+                st.rerun()
+            if y2.button("☎️ Wrong / dead number", key=f"ca_bad_{rid}", **FULL_WIDTH,
+                         help="Takes it off the call list. Find a new number with Enrich on the Customers page."):
+                log_outcome(rid, "Wrong number", notes, status="Bad number", clear_next=True, fields=learned)
+                ss["sh_flash"] = f"☎️ {esc(rec_label(r))} marked as a bad number."
+                ss["caller_rid"] = None
+                st.rerun()
+            x1, x2, x3, x4 = st.columns([1.25, 1, 1, 0.75])
             if x1.button("👎 Not interested", key=f"ca_ni_{rid}", **FULL_WIDTH):
-                log_outcome(rid, "Not interested", notes, status="Not interested", clear_next=True)
+                log_outcome(rid, "Not interested", notes, status="Not interested", clear_next=True, fields=learned)
                 ss["sh_flash"] = f"👎 {esc(rec_label(r))} marked not interested."
                 ss["caller_rid"] = None
                 st.rerun()
             if x2.button("🚫 Do not call", key=f"ca_dnc_{rid}", **FULL_WIDTH, help="Wrong number, or asked not to be called"):
-                log_outcome(rid, "Do not call", notes, status="Do not call", clear_next=True)
+                log_outcome(rid, "Do not call", notes, status="Do not call", clear_next=True, fields=learned)
                 ss["sh_flash"] = f"🚫 {esc(rec_label(r))} won't be called again."
                 ss["caller_rid"] = None
                 st.rerun()
             if x3.button("✉️ Email info", key=f"ca_em_{rid}", disabled=not r.get("email"), **FULL_WIDTH,
                          help="Logs the call, then opens the pitch email and PDF ready to send via Zoho"):
-                log_outcome(rid, "Asked for info", notes, next_action=next_working_day(today, 3), status="Call back")
+                log_outcome(rid, "Asked for info", notes, next_action=next_working_day(today, 3), status="Call back",
+                            fields=learned)
                 to_queue_for_email(rid)
                 st.rerun()
             if x4.button("⏭ Skip", key=f"ca_skip_{rid}", **FULL_WIDTH, help="Move on without logging anything"):
@@ -7817,10 +8564,10 @@ def render_caller_page() -> None:
                 ss["caller_rid"] = nxt
                 ss["caller_pin"] = True
                 st.rerun()
-            with st.expander("💷 Deal won"):
+            with st.expander("💷 Sold on the phone"):
                 deal = deal_inputs(f"ca_deal_{rid}", r)
-                if st.button("💷 Save as won", key=f"ca_won_{rid}", type="primary"):
-                    log_outcome(rid, "Won", notes, status="Won", deal=deal, clear_next=True)
+                if st.button("💷 Save as sold", key=f"ca_won_{rid}", type="primary"):
+                    log_outcome(rid, "Won", notes, status="Won", deal=deal, clear_next=True, fields=learned)
                     ss["sh_flash"] = f"💷 Won: {esc(rec_label(r))}, {money(deal['mrr'])}/month over {deal['term']} months" + \
                         (f" + {money(deal['one_off'])} one-off." if deal["one_off"] else ".")
                     ss["caller_rid"] = None
@@ -7844,7 +8591,7 @@ def render_caller_page() -> None:
                 rx = data[x]
                 nd = to_date(rx.get("next_action"))
                 lbl = f"{rec_label(rx)}  ·  {rx.get('town') or rx.get('postcode') or ''}" + (
-                    f"  ·  due {nd.strftime('%d %b')}" if nd else "")
+                    f"  ·  due {nd.strftime('%d %b')}" if nd else "") + (f" {rx['next_time']}" if rx.get("next_time") else "")
                 if st.button(lbl, key=f"ca_jump_{x}", **FULL_WIDTH):
                     ss["caller_rid"] = x
                     ss["caller_pin"] = True
@@ -8013,14 +8760,15 @@ def render_overview_page() -> None:
              "Last 30 days": today - timedelta(days=29), "This year": today.replace(month=1, day=1),
              "All time": date(2000, 1, 1)}[period]
     in_p = lambda iso: bool(iso) and (to_date(str(iso)[:10]) or date.min) >= start  # noqa: E731
+    render_funnel(recs, start, period)
 
     calls = [dict(c, rid=r["id"], company=rec_label(r)) for r in recs for c in calls_of(r)
-             if c.get("outcome") not in ("Note", "Edited", "Status changed")]
+             if c.get("outcome") not in ("Note", "Edited", "Status changed") and c.get("by") != "Old sheet"]
     calls_p = [c for c in calls if in_p(c.get("at"))]
     appts = [dict(a, rid=r["id"], company=rec_label(r), town=r.get("town") or "", postcode=r.get("postcode") or "")
              for r in recs for a in (r.get("appointments") or []) if isinstance(a, dict)]
     booked_p = [a for a in appts if in_p(a.get("booked_at"))]
-    won = [r for r in recs if r.get("status") == "Won"]
+    won = [r for r in recs if r.get("status") in SOLD]
     won_p = [r for r in won if in_p((r.get("deal") or {}).get("won_at"))]
     mrr_p = sum(deal_values(r)[0] for r in won_p)
     one_p = sum(deal_values(r)[1] for r in won_p)
@@ -8210,13 +8958,812 @@ def add_queue_to_crm(cns: List[str]) -> Tuple[int, int]:
     return len(changes), there
 
 
+# ==========================================================================================
+# GROUPS: find a slice of the list in a few clicks (area, staff, credit, lease end…) and save it to reuse
+# ==========================================================================================
+GROUP_STORE = SentLog("GITHUB_GROUPS_PATH", "groups.json", ".sales_hub_groups.json")
+LEASE_BANDS = ["Ended 12+ months ago", "Ended in the last 12 months", "Ends in the next 6 months",
+               "Ends in 6-12 months", "Ends in 12+ months", "No end date"]
+TPS_OPTS = ["Leave out TPS / CTPS numbers", "Include them", "Only TPS / CTPS"]
+OWNER_OPTS = ["Anyone", "Mine", "Unassigned"]
+SEG_DEFAULT: Dict[str, Any] = {
+    "q": "", "status": [], "areas": [], "district": "", "regions": [], "sectors": [], "emp": [], "credit": [],
+    "lease": [], "markets": [], "assets": [], "lines": [], "tags": [], "sources": [], "handsets_min": 0,
+    "tps": TPS_OPTS[0], "trading_only": True, "owner": OWNER_OPTS[0], "gaps": False,
+}
+
+
+def end_date_of(r: Dict[str, Any]) -> Optional[date]:
+    """Their phone contract end if the caller has found it out, otherwise the lease end from the data."""
+    return to_date(r.get("contract_end")) or to_date(r.get("lease_end"))
+
+
+def lease_band(r: Dict[str, Any], today: date) -> str:
+    d = end_date_of(r)
+    if not d:
+        return LEASE_BANDS[5]
+    days = (d - today).days
+    if days < -365:
+        return LEASE_BANDS[0]
+    if days < 0:
+        return LEASE_BANDS[1]
+    if days <= 183:
+        return LEASE_BANDS[2]
+    if days <= 365:
+        return LEASE_BANDS[3]
+    return LEASE_BANDS[4]
+
+
+def is_tps(r: Dict[str, Any]) -> bool:
+    return bool(r.get("tps")) and not r.get("tps_ok")
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _seg_options(sig: Tuple[Any, ...], _data: Dict[str, Any]) -> Dict[str, List[Tuple[str, int]]]:
+    """Every value in the list for each filter, with how many records have it (cached until the list changes)."""
+    from collections import Counter
+    c: Dict[str, Counter] = {k: Counter() for k in ("areas", "regions", "sectors", "markets", "assets", "lines",
+                                                     "tags", "sources")}
+    for r in _data.values():
+        if not isinstance(r, dict):
+            continue
+        a = pc_area(r.get("postcode") or "")
+        if a:
+            c["areas"][a] += 1
+        for k, f in (("regions", "region"), ("sectors", "sector"), ("markets", "lease_market"),
+                     ("assets", "lease_asset"), ("lines", "line_type"), ("sources", "source")):
+            if r.get(f):
+                c[k][str(r[f])] += 1
+        for t in r.get("tags") or []:
+            c["tags"][t] += 1
+    return {k: sorted(v.items(), key=lambda kv: (-kv[1], kv[0])) for k, v in c.items()}
+
+
+def seg_options() -> Dict[str, List[Tuple[str, int]]]:
+    data = crm_get()
+    return _seg_options((st.session_state.get("crm_sig"), len(data), st.session_state.get("crm_ver", 0)), data)
+
+
+def seg_match(r: Dict[str, Any], seg: Dict[str, Any], today: date, me: str = "") -> bool:
+    st_ = r.get("status") or "New"
+    if seg.get("status") and st_ not in seg["status"]:
+        return False
+    if seg.get("trading_only") and r.get("trading_ok") is False:
+        return False
+    tps = seg.get("tps") or TPS_OPTS[0]
+    if tps == TPS_OPTS[0] and is_tps(r):
+        return False
+    if tps == TPS_OPTS[2] and not is_tps(r):
+        return False
+    if seg.get("areas") and pc_area(r.get("postcode") or "") not in seg["areas"]:
+        return False
+    if seg.get("district"):
+        parts = [p.strip() for p in re.split(r"[,;]", seg["district"]) if p.strip()]
+        if parts and not any(area_match(r, p) or norm_pc(r.get("postcode") or "").startswith(p.upper().replace(" ", ""))
+                             for p in parts):
+            return False
+    for k, f in (("regions", "region"), ("sectors", "sector"), ("markets", "lease_market"), ("assets", "lease_asset"),
+                 ("lines", "line_type"), ("sources", "source")):
+        if seg.get(k) and str(r.get(f) or "") not in seg[k]:
+            return False
+    if seg.get("tags") and not set(seg["tags"]) & set(r.get("tags") or []):
+        return False
+    if seg.get("emp") and emp_band(r.get("employees")) not in seg["emp"]:
+        return False
+    if seg.get("credit") and (credit_band(r.get("credit_rating")) or "Not rated") not in seg["credit"]:
+        return False
+    if seg.get("lease") and lease_band(r, today) not in seg["lease"]:
+        return False
+    if seg.get("handsets_min") and int(to_num(r.get("handsets")) or 0) < int(seg["handsets_min"]):
+        return False
+    own = seg.get("owner") or "Anyone"
+    if own == "Mine" and (r.get("owner") or "") != me:
+        return False
+    if own == "Unassigned" and r.get("owner"):
+        return False
+    if seg.get("gaps") and (r.get("email") and (r.get("phone") or r.get("mobile"))):
+        return False
+    q = (seg.get("q") or "").strip().lower()
+    if q:
+        hay = " ".join(str(r.get(k) or "") for k in ("company", "trading_name", "contact", "phone", "mobile", "ho_phone",
+                                                     "email", "town", "postcode", "notes", "sector", "company_number",
+                                                     "provider", "lease_supplier")).lower()
+        if q not in hay and _n(q) not in _n(hay):
+            return False
+    return True
+
+
+def _seg_key(prefix: str, k: str) -> str:
+    return f"{prefix}_seg_{k}"
+
+
+def seg_from_state(prefix: str) -> Dict[str, Any]:
+    ss = st.session_state
+    return {k: ss.get(_seg_key(prefix, k), v) for k, v in SEG_DEFAULT.items()}
+
+
+def _load_group(prefix: str) -> None:
+    ss = st.session_state
+    name = ss.get(f"{prefix}_group")
+    groups = GROUP_STORE.load() if name else {}
+    seg = dict(SEG_DEFAULT, **((groups.get(name) or {}).get("seg") or {})) if name else dict(SEG_DEFAULT)
+    for k, v in seg.items():
+        ss[_seg_key(prefix, k)] = v
+
+
+def seg_summary(seg: Dict[str, Any]) -> str:
+    bits = []
+    for k, lbl in (("areas", ""), ("regions", ""), ("emp", "staff "), ("credit", "credit "), ("lease", ""),
+                   ("markets", ""), ("assets", ""), ("lines", ""), ("sectors", ""), ("tags", ""), ("status", "")):
+        if seg.get(k):
+            bits.append(lbl + ", ".join(seg[k][:4]) + ("…" if len(seg[k]) > 4 else ""))
+    if seg.get("district"):
+        bits.append(seg["district"])
+    if seg.get("handsets_min"):
+        bits.append(f"{seg['handsets_min']}+ handsets")
+    if seg.get("q"):
+        bits.append(f'"{seg["q"]}"')
+    return " · ".join(bits) or "Everyone"
+
+
+def render_segment_filters(prefix: str, show_status: bool = True, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The filter panel used on Customers and the Caller. Returns the chosen filters."""
+    ss = st.session_state
+    for k, v in dict(SEG_DEFAULT, **(defaults or {})).items():
+        ss.setdefault(_seg_key(prefix, k), v)
+    opts = seg_options()
+    fmt = lambda pairs: {k: f"{k}  ({n:,})" for k, n in pairs}  # noqa: E731
+    groups = GROUP_STORE.load()
+    names = sorted(groups)
+    g1, g2, g3 = st.columns([1.3, 1.6, 1.3])
+    g1.selectbox("Saved group", [""] + names, key=f"{prefix}_group", on_change=_load_group, args=(prefix,),
+                 format_func=lambda n: n or "— Everyone (no group) —",
+                 help="Pick a saved group to load its filters. Save the current filters as a group below.")
+    g2.text_input("Search", key=_seg_key(prefix, "q"), placeholder="Company, contact, phone, postcode, supplier…")
+    am = fmt(opts["areas"])
+    g3.multiselect("Postcode area", [a for a, _ in opts["areas"]], key=_seg_key(prefix, "areas"),
+                   format_func=lambda a: am.get(a, a), placeholder="e.g. CF, NP, SA")
+    h1, h2, h3, h4 = st.columns(4)
+    h1.multiselect("Staff", [b for b, _, _ in EMP_BANDS] + ["Unknown"], key=_seg_key(prefix, "emp"), placeholder="Any size")
+    h2.multiselect("Lease / contract end", LEASE_BANDS, key=_seg_key(prefix, "lease"), placeholder="Any")
+    h3.multiselect("Credit", [b for b, *_ in CREDIT_BANDS] + ["Not rated"], key=_seg_key(prefix, "credit"),
+                   format_func=lambda b: next((f"{b} · {d}" for x, _, _, d in CREDIT_BANDS if x == b), b), placeholder="Any")
+    if show_status:
+        h4.multiselect("Status", PIPELINE, key=_seg_key(prefix, "status"), placeholder="Any")
+    else:
+        h4.selectbox("Whose", OWNER_OPTS, key=_seg_key(prefix, "owner"))
+    with st.expander("More filters: region, town, sector, equipment, phone line, tags…"):
+        m1, m2, m3 = st.columns(3)
+        rm = fmt(opts["regions"])
+        m1.multiselect("Region", [a for a, _ in opts["regions"]], key=_seg_key(prefix, "regions"),
+                       format_func=lambda a: rm.get(a, a), placeholder="Any")
+        m2.text_input("Districts or towns", key=_seg_key(prefix, "district"), placeholder="e.g. CF10, CF11, Newport")
+        sm = fmt(opts["sectors"])
+        m3.multiselect("Sector", [a for a, _ in opts["sectors"]], key=_seg_key(prefix, "sectors"),
+                       format_func=lambda a: sm.get(a, a), placeholder="Any")
+        n1, n2, n3 = st.columns(3)
+        mm = fmt(opts["markets"])
+        n1.multiselect("Leased equipment type", [a for a, _ in opts["markets"]], key=_seg_key(prefix, "markets"),
+                       format_func=lambda a: mm.get(a, a), placeholder="Any", help="From the leasing data, e.g. Telecoms")
+        asm = fmt(opts["assets"][:60])
+        n2.multiselect("Leased asset", [a for a, _ in opts["assets"][:60]], key=_seg_key(prefix, "assets"),
+                       format_func=lambda a: asm.get(a, a), placeholder="Any", help="e.g. Office Telecoms, Copier")
+        lm = fmt(opts["lines"])
+        n3.multiselect("Phone line type", [a for a, _ in opts["lines"]], key=_seg_key(prefix, "lines"),
+                       format_func=lambda a: lm.get(a, a), placeholder="Any",
+                       help="ISDN and analogue lines are switched off in the 2027 digital switchover")
+        o1, o2, o3 = st.columns(3)
+        tm = fmt(opts["tags"])
+        o1.multiselect("Tags", [a for a, _ in opts["tags"]], key=_seg_key(prefix, "tags"),
+                       format_func=lambda a: tm.get(a, a), placeholder="Any")
+        srm = fmt(opts["sources"])
+        o2.multiselect("Came from", [a for a, _ in opts["sources"]], key=_seg_key(prefix, "sources"),
+                       format_func=lambda a: srm.get(a, a), placeholder="Any list")
+        o3.number_input("At least this many handsets", min_value=0, step=1, key=_seg_key(prefix, "handsets_min"),
+                        help="Only counts records where a handset number has been filled in")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.selectbox("TPS / CTPS", TPS_OPTS, key=_seg_key(prefix, "tps"),
+                     help="Numbers registered with TPS/CTPS shouldn't get unsolicited sales calls")
+        if show_status:
+            p2.selectbox("Whose", OWNER_OPTS, key=_seg_key(prefix, "owner"))
+        p3.toggle("Trading companies only", key=_seg_key(prefix, "trading_only"),
+                  help="Hides firms marked dissolved, in liquidation or administration")
+        p4.toggle("Missing email or phone", key=_seg_key(prefix, "gaps"))
+    seg = seg_from_state(prefix)
+    with st.popover("💾 Save these filters as a group"):
+        nm = st.text_input("Group name", key=f"{prefix}_gname", placeholder="e.g. Cardiff 10-49 staff, lease ended")
+        st.caption(seg_summary(seg))
+        if st.button("Save group", key=f"{prefix}_gsave", type="primary", disabled=not nm.strip()):
+            try:
+                GROUP_STORE.apply({nm.strip(): {"seg": seg, "by": crm_user(), "at": now_uk().isoformat(timespec="seconds")}},
+                                  f"Sales Hub: saved group {nm.strip()}")
+                ss["sh_flash"] = f"💾 Saved the group <b>{esc(nm.strip())}</b>. Pick it from Saved group any time."
+            except Exception as exc:
+                ss["sh_flash"] = f"⚠️ Couldn't save the group: {esc(str(exc))}"
+            st.rerun()
+        cur = ss.get(f"{prefix}_group")
+        if cur and st.button(f"🗑 Delete '{cur}'", key=f"{prefix}_gdel"):
+            try:
+                GROUP_STORE.apply({cur: None}, f"Sales Hub: deleted group {cur}")
+            except Exception:
+                pass
+            ss[f"{prefix}_group"] = ""
+            st.rerun()
+    return seg
+
+
+# ---------------- Extra detail on a record (from the master data + what the caller learns) ----------------
+def facts_chips(r: Dict[str, Any]) -> List[str]:
+    today = now_uk().date()
+    out = []
+    if is_tps(r):
+        out.append(chip("⛔ TPS registered", "bad"))
+    if r.get("trading_ok") is False:
+        out.append(chip("⚠️ " + (r.get("company_status") or "Not trading"), "bad"))
+    if r.get("employees"):
+        out.append(chip(f"👥 {int(r['employees'])} staff", ""))
+    if r.get("handsets"):
+        out.append(chip(f"☎️ {int(to_num(r['handsets']))} handsets", "good"))
+    b = credit_band(r.get("credit_rating"))
+    if b:
+        out.append(chip(f"Credit {b} ({int(r['credit_rating'])})", "good" if b in "AB" else ("warn" if b == "C" else "risk")))
+    if r.get("line_type"):
+        out.append(chip(f"Lines: {r['line_type']}", "warn" if r["line_type"] in ("ISDN", "Analogue") else ""))
+    d = end_date_of(r)
+    if d:
+        lbl = "Contract" if r.get("contract_end") else "Lease"
+        out.append(chip(f"{lbl} {'ended' if d < today else 'ends'} {d.strftime('%b %Y')}", "warn" if d < today + timedelta(days=183) else ""))
+    if r.get("provider"):
+        out.append(chip(f"With {r['provider']}", "muted"))
+    for t in (r.get("tags") or [])[:4]:
+        out.append(chip("🏷 " + t, "accent"))
+    return out
+
+
+def lease_html(r: Dict[str, Any]) -> str:
+    if not any(r.get(k) for k in ("lease_asset", "lease_rental", "lease_end", "lease_supplier")):
+        return ""
+    bits = []
+    if r.get("lease_asset") or r.get("lease_market"):
+        bits.append(" / ".join(x for x in (r.get("lease_asset"), r.get("lease_market")) if x))
+    if r.get("lease_rental"):
+        bits.append(f"{money(r['lease_rental'])} {(r.get('lease_freq') or '').lower()}".strip())
+    if r.get("lease_term"):
+        bits.append(f"{r['lease_term']}-month term")
+    if r.get("lease_end"):
+        bits.append("end " + to_date(r["lease_end"]).strftime("%d %b %Y"))
+    if r.get("lease_supplier"):
+        bits.append("via " + r["lease_supplier"])
+    return f'<div class="sh-line">📄 Lease: <b>{esc(" · ".join(bits))}</b></div>'
+
+
+def company_facts_html(r: Dict[str, Any]) -> str:
+    bits = []
+    if r.get("sic_desc"):
+        bits.append(r["sic_desc"])
+    if r.get("turnover"):
+        bits.append(f"turnover {money(r['turnover'])}")
+    if r.get("incorporated"):
+        bits.append("since " + str(r["incorporated"])[:4])
+    if r.get("company_number"):
+        bits.append(f"#{r['company_number']}")
+    return f'<div class="sh-line" style="color:var(--faint)">🏢 {esc(" · ".join(bits))}</div>' if bits else ""
+
+
+TIME_SLOTS = [""] + [f"{h:02d}:{m:02d}" for h in range(8, 19) for m in (0, 30)]
+
+
+def due_now(r: Dict[str, Any], now: datetime) -> bool:
+    """Due a call: next action date has come, and if a time was given, it's within 10 minutes of it."""
+    nd = to_date(r.get("next_action"))
+    if not nd or nd > now.date():
+        return False
+    if nd < now.date() or not r.get("next_time"):
+        return True
+    try:
+        hh, mm = (int(x) for x in str(r["next_time"]).split(":")[:2])
+    except ValueError:
+        return True
+    return now + timedelta(minutes=10) >= now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+# ---------------- Sales reps ----------------
+def rep_names() -> List[str]:
+    names: List[str] = []
+    try:
+        raw = st.secrets.get("SALES_REPS") or []
+        names += [x.strip() for x in (raw.split(",") if isinstance(raw, str) else list(raw)) if str(x).strip()]
+        names += [str(k) for k in dict(st.secrets.get("HUB_USERS") or {})]
+    except Exception:
+        pass
+    for r in crm_get().values():
+        if not isinstance(r, dict):
+            continue
+        for a in r.get("appointments") or []:
+            if isinstance(a, dict) and a.get("rep"):
+                names.append(a["rep"])
+        if (r.get("deal") or {}).get("won_by"):
+            names.append(r["deal"]["won_by"])
+    return sorted(dict.fromkeys(n for n in names if n), key=str.lower)
+
+
+def rep_picker(container, label: str, key: str, value: str = "") -> str:
+    opts = [""] + rep_names()
+    if value and value not in opts:
+        opts.append(value)
+    try:
+        pick = container.selectbox(label, opts, index=opts.index(value) if value in opts else 0, key=key,
+                                   accept_new_options=True, format_func=lambda n: n or "— pick or type a name —")
+    except TypeError:
+        pick = container.text_input(label, value=value, key=key)
+    return (pick or "").strip()
+
+
+def appts_of(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [a for a in (rec.get("appointments") or []) if isinstance(a, dict) and a.get("at")]
+
+
+def last_appt(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ap = appts_of(rec)
+    return max(ap, key=lambda a: a["at"]) if ap else None
+
+
+def is_sat(a: Dict[str, Any]) -> bool:
+    return str(a.get("result") or "").startswith("Sat")
+
+
+# ---------------- 🗓 Call-backs (the telesales day) ----------------
+def render_callbacks_page() -> None:
+    ss = st.session_state
+    data = crm_get()
+    now = now_uk()
+    today = now.date()
+    if not name_gate():
+        return
+    mine_only = ss.get("cb_mine", False)
+    me = crm_user()
+    open_recs = [r for r in data.values() if isinstance(r, dict) and (r.get("status") or "New") not in CLOSED
+                 and to_date(r.get("next_action")) and (not mine_only or (r.get("owner") or "") == me)]
+    week_end = today + timedelta(days=6 - today.weekday() + 7 if today.weekday() >= 5 else 6 - today.weekday())
+    groups = [("🔴 Overdue", [r for r in open_recs if to_date(r["next_action"]) < today], "risk"),
+              ("🟠 Today", [r for r in open_recs if to_date(r["next_action"]) == today], "warn"),
+              ("🟡 Tomorrow", [r for r in open_recs if to_date(r["next_action"]) == next_working_day(today)], ""),
+              ("🗓 Rest of this week", [r for r in open_recs if next_working_day(today) < to_date(r["next_action"]) <= week_end], "muted")]
+    appts_today = sorted(((a, r) for r in data.values() if isinstance(r, dict) for a in appts_of(r)
+                          if not a.get("cancelled") and str(a["at"])[:10] == today.isoformat()), key=lambda x: x[0]["at"])
+    sh_hero('Call-backs <span>&amp; today</span>', "Everyone you promised to ring, in order. Click a name to open it in"
+            " the Caller.", [(str(len(groups[0][1])), "Overdue", "active"), (str(len(groups[1][1])), "Today", ""),
+                             (str(len(groups[2][1])), "Tomorrow", ""), (str(len(appts_today)), "Appointments today", "done")],
+            f"{now.strftime('%A %d %B')} · {me}")
+    flash()
+    show_crm_error()
+    st.toggle("Only my call-backs", key="cb_mine")
+    if appts_today:
+        with st.container(key="card-sh-cbap"):
+            section_header("📅", "Appointments today", "Booked visits and calls")
+            st.dataframe(pd.DataFrame([{"Time": (_when(a["at"]) or now).strftime("%H:%M"), "Company": rec_label(r),
+                                        "Where": " ".join(x for x in (r.get("town"), r.get("postcode")) if x),
+                                        "Type": a.get("kind") or "", "With": a.get("with") or "",
+                                        "Rep": a.get("rep") or "", "Booked by": a.get("booked_by") or ""}
+                                       for a, r in appts_today]), hide_index=True, **FULL_WIDTH)
+    for gi, (title, recs, tone) in enumerate(groups):
+        recs = sorted(recs, key=lambda r: (r["next_action"], r.get("next_time") or "99", rec_label(r).lower()))
+        with st.container(key=f"card-sh-cb{gi}"):
+            section_header(title.split(" ")[0], " ".join(title.split(" ")[1:]), f"{len(recs)} to call")
+            if not recs:
+                st.caption("Nothing here. 👏" if gi < 2 else "Nothing booked yet.")
+                continue
+            df = pd.DataFrame([{"When": to_date(r["next_action"]).strftime("%a %d %b") + (f" {r['next_time']}" if r.get("next_time") else ""),
+                                "Company": rec_label(r), "Phone": r.get("phone") or r.get("mobile") or r.get("ho_phone") or "",
+                                "Contact": r.get("contact") or "", "Status": r.get("status") or "",
+                                "Last note": ((last_call(r) or {}).get("notes") or r.get("next_note") or "")[:80],
+                                "Owner": r.get("owner") or ""} for r in recs[:300]])
+            try:
+                ev = st.dataframe(df, hide_index=True, width="stretch", selection_mode="single-row", on_select="rerun",
+                                  key=f"cb_tbl_{gi}_{ss.get('crm_ver', 0)}", height=min(38 + 35 * len(df), 420))
+            except TypeError:
+                ev = st.dataframe(df, hide_index=True, use_container_width=True, selection_mode="single-row",
+                                  on_select="rerun", key=f"cb_tbl_{gi}_{ss.get('crm_ver', 0)}")
+            rows = ev.selection.rows if ev else []
+            c1, c2 = st.columns([1, 2])
+            if rows:
+                pick = recs[rows[0]]
+                if c1.button(f"📞 Call {rec_label(pick)}", key=f"cb_go_{gi}", type="primary", **FULL_WIDTH):
+                    ss["caller_rid"], ss["caller_pin"] = pick["id"], True
+                    goto_view("caller")
+                    st.rerun()
+            if c2.button(f"📞 Work through all {len(recs)} in the Caller", key=f"cb_all_{gi}", **FULL_WIDTH):
+                ss["caller_focus"] = [r["id"] for r in recs]
+                open_in_caller(recs[0]["id"])
+                st.rerun()
+
+
+# ---------------- 💼 Pipeline (appointments → sat → sold → installed) ----------------
+def apply_appt_result(rec: Dict[str, Any], appt_at: str, result: str, deal: Dict[str, Any], who: str) -> Dict[str, Any]:
+    rec = dict(rec)
+    today = now_uk().date()
+    stamp = now_uk().isoformat(timespec="seconds")
+    aps = []
+    for a in appts_of(rec):
+        if a["at"] == appt_at:
+            a = dict(a, result=result, result_at=stamp, result_by=who, cancelled=result == "Cancelled")
+        aps.append(a)
+    rec["appointments"] = aps
+    a = next((x for x in aps if x["at"] == appt_at), {})
+    note = f"{result}" + (f" (rep {a.get('rep')})" if a.get("rep") else "")
+    if result == "Sat – sold":
+        rec["status"] = "Won"
+        rec["deal"] = dict(rec.get("deal") or {}, **{k: v for k, v in deal.items() if v not in (None, "")})
+        rec["deal"].setdefault("won_at", str(a.get("at", ""))[:10] or today.isoformat())
+        rec["deal"]["won_by"] = rec["deal"].get("won_by") or a.get("rep") or who
+        rec["deal"]["booked_by"] = a.get("booked_by") or ""
+        rec["next_action"] = rec["next_time"] = ""
+    elif result == "Sat – quoted / thinking":
+        rec["status"] = "Quoted"
+        rec["next_action"], rec["next_time"] = next_working_day(today, 3).isoformat(), ""
+    elif result == "Sat – not sold":
+        rec["status"] = "Lost"
+        rec["next_action"] = rec["next_time"] = ""
+    elif result in ("No show", "Cancelled"):
+        rec["status"] = "Call back"
+        rec["next_action"], rec["next_time"] = today.isoformat(), ""
+        note += ": call to rebook"
+    rec["calls"] = calls_of(rec) + [{"at": stamp, "by": who, "outcome": "Appointment: " + result, "notes": note}]
+    return rec
+
+
+def render_pipeline_page() -> None:
+    ss = st.session_state
+    data = crm_get()
+    now = now_uk()
+    today = now.date()
+    if not name_gate():
+        return
+    recs = [r for r in data.values() if isinstance(r, dict)]
+    pending = sorted(((a, r) for r in recs for a in appts_of(r) if not a.get("result") and not a.get("cancelled")
+                      and (_when(a["at"]) or now) <= now + timedelta(hours=1)), key=lambda x: x[0]["at"])
+    upcoming = [(a, r) for r in recs for a in appts_of(r) if not a.get("result") and not a.get("cancelled")
+                and (_when(a["at"]) or now) > now + timedelta(hours=1)]
+    awaiting = [r for r in recs if r.get("status") == "Won"]
+    sh_hero('Sales <span>pipeline</span>', "Booked → sat → sold → installed. Record how each appointment went and keep"
+            " deal values up to date: the Overview reports from here.",
+            [(str(len(upcoming)), "Booked ahead", ""), (str(len(pending)), "Need an outcome", "active"),
+             (str(len(awaiting)), "Sold, awaiting install", ""),
+             (str(sum(1 for r in recs if r.get("status") == "Installed")), "Installed", "done")], f"Updating as {crm_user()}")
+    flash()
+    show_crm_error()
+
+    with st.container(key="card-sh-pl1"):
+        section_header("01", "How did the appointment go?",
+                       "Appointments that have happened but have no result yet. Pick a result, add the deal for sales,"
+                       " then save.")
+        if not pending:
+            st.caption("All appointments have a result. 👏")
+        else:
+            df = pd.DataFrame([{"_rid": r["id"], "_at": a["at"],
+                                "When": (_when(a["at"]) or now).strftime("%a %d %b %H:%M"), "Company": rec_label(r),
+                                "Booked by": a.get("booked_by") or "", "Rep": a.get("rep") or "", "Result": "",
+                                "Monthly £": float(to_num((r.get("deal") or {}).get("mrr"))) or None,
+                                "One-off £": float(to_num((r.get("deal") or {}).get("one_off"))) or None,
+                                "Term (months)": int(to_num((r.get("deal") or {}).get("term")) or 0) or None,
+                                "Install date": to_date((r.get("deal") or {}).get("install_date"))}
+                               for a, r in pending])
+            ed = st.data_editor(df, hide_index=True, key=f"pl_ed1_{ss.get('crm_ver', 0)}", **FULL_WIDTH,
+                                column_order=["When", "Company", "Booked by", "Rep", "Result", "Monthly £", "One-off £",
+                                              "Term (months)", "Install date"],
+                                disabled=["When", "Company", "Booked by"],
+                                column_config={"Result": st.column_config.SelectboxColumn("Result", options=APPT_RESULTS,
+                                                                                          width="medium"),
+                                               "Rep": st.column_config.SelectboxColumn("Rep", options=[""] + rep_names()),
+                                               "Monthly £": st.column_config.NumberColumn("Monthly £", min_value=0, format="£%.2f"),
+                                               "One-off £": st.column_config.NumberColumn("One-off £", min_value=0, format="£%.2f"),
+                                               "Term (months)": st.column_config.SelectboxColumn("Term (months)", options=DEAL_TERMS),
+                                               "Install date": st.column_config.DateColumn("Install date", format="DD/MM/YYYY")})
+            done = ed[ed["Result"].fillna("") != ""]
+            if st.button(f"💾 Save {len(done)} result(s)", type="primary", disabled=done.empty, key="pl_save1"):
+                latest = crm_get()
+                changes = {}
+                for _, row in done.iterrows():
+                    rid = row["_rid"]
+                    rec = changes.get(rid) or latest.get(rid)
+                    if not rec:
+                        continue
+                    nv = lambda c: None if c not in row or pd.isna(row[c]) or row[c] == "" else row[c]  # noqa: E731
+                    if nv("Rep"):
+                        rec = dict(rec, appointments=[dict(a, rep=nv("Rep")) if a["at"] == row["_at"] else a
+                                                      for a in appts_of(rec)])
+                    deal = {"mrr": float(nv("Monthly £") or 0), "one_off": float(nv("One-off £") or 0),
+                            "term": int(nv("Term (months)") or 36),
+                            "install_date": nv("Install date").isoformat() if nv("Install date") else "",
+                            "won_by": nv("Rep") or ""}
+                    changes[rid] = apply_appt_result(rec, row["_at"], row["Result"], deal, crm_user())
+                if changes:
+                    crm_save(changes, f"{len(changes)} appointment result(s)")
+                    ss["sh_flash"] = f"💾 Saved {len(changes)} appointment result(s)."
+                st.rerun()
+
+    with st.container(key="card-sh-pl2"):
+        section_header("02", "Deals", "Quoted, sold and installed. Edit any cell (values, rep, install date, stage),"
+                       " then save. Set the stage to Installed once it's in.")
+        f1, f2 = st.columns([2, 1])
+        stages = f1.multiselect("Show", ["Quoted", "Won", "Installed", "Lost"], default=["Quoted", "Won", "Installed"],
+                                key="pl_stages", format_func=lambda s_: {"Won": "Sold (awaiting install)"}.get(s_, s_))
+        since = f2.date_input("Sold / updated since", value=today - timedelta(days=365), format="DD/MM/YYYY", key="pl_since")
+        rows = [r for r in recs if r.get("status") in stages and
+                (to_date((r.get("deal") or {}).get("won_at")) or to_date(str(r.get("updated_at") or "")[:10]) or today) >= since]
+        rows.sort(key=lambda r: (["Quoted", "Won", "Installed", "Lost"].index(r["status"]),
+                                 str((r.get("deal") or {}).get("won_at") or "")), reverse=False)
+        if not rows:
+            st.caption("No deals in this view yet.")
+        else:
+            def _row(r: Dict[str, Any]) -> Dict[str, Any]:
+                d = r.get("deal") or {}
+                la = last_appt(r) or {}
+                mrr, one, term, tcv = deal_values(r)
+                return {"_rid": r["id"], "Company": rec_label(r), "Stage": r["status"],
+                        "Booked by": d.get("booked_by") or la.get("booked_by") or "",
+                        "Rep": d.get("won_by") or la.get("rep") or "", "Sold on": to_date(d.get("won_at")),
+                        "Monthly £": mrr or None, "One-off £": one or None, "Term (months)": term or None,
+                        "Contract value £": tcv or None, "Install date": to_date(d.get("install_date")),
+                        "Handsets": int(to_num(r.get("handsets")) or 0) or None, "Deal notes": d.get("notes") or ""}
+            df2 = pd.DataFrame([_row(r) for r in rows])
+            ed2 = st.data_editor(df2, hide_index=True, key=f"pl_ed2_{ss.get('crm_ver', 0)}", **FULL_WIDTH,
+                                 column_order=[c for c in df2.columns if not c.startswith("_")],
+                                 disabled=["Company", "Contract value £"],
+                                 column_config={
+                                     "Stage": st.column_config.SelectboxColumn("Stage", options=["Quoted", "Won", "Installed", "Lost"]),
+                                     "Rep": st.column_config.SelectboxColumn("Rep", options=[""] + rep_names()),
+                                     "Booked by": st.column_config.TextColumn("Booked by"),
+                                     "Sold on": st.column_config.DateColumn("Sold on", format="DD/MM/YYYY"),
+                                     "Install date": st.column_config.DateColumn("Install date", format="DD/MM/YYYY"),
+                                     "Monthly £": st.column_config.NumberColumn("Monthly £", min_value=0, format="£%.2f"),
+                                     "One-off £": st.column_config.NumberColumn("One-off £", min_value=0, format="£%.2f"),
+                                     "Contract value £": st.column_config.NumberColumn("Contract value £", format="£%.0f"),
+                                     "Term (months)": st.column_config.SelectboxColumn("Term (months)", options=DEAL_TERMS),
+                                     "Handsets": st.column_config.NumberColumn("Handsets", min_value=0, step=1)})
+            tot = ed2.fillna({"Monthly £": 0, "One-off £": 0, "Term (months)": 0})
+            st.caption(f"In this view: **{money(float(tot['Monthly £'].sum()))}/month**, "
+                       f"**{money(float((tot['Monthly £'] * tot['Term (months)']).sum() + tot['One-off £'].sum()))}** total contract value.")
+            if st.button("💾 Save deal changes", type="primary", key="pl_save2"):
+                latest = crm_get()
+                changes = {}
+                stamp = now_uk().isoformat(timespec="seconds")
+                cols = ["Stage", "Booked by", "Rep", "Sold on", "Monthly £", "One-off £", "Term (months)", "Install date",
+                        "Handsets", "Deal notes"]
+                for (_, new), (_, old) in zip(ed2.iterrows(), df2.iterrows()):
+                    same = all((pd.isna(new[c]) and pd.isna(old[c])) or new[c] == old[c] for c in cols)
+                    if same or new["_rid"] not in latest:
+                        continue
+                    rec = dict(latest[new["_rid"]])
+                    d = dict(rec.get("deal") or {})
+                    nv = lambda c: None if pd.isna(new[c]) else new[c]  # noqa: E731
+                    d.update({"mrr": float(nv("Monthly £") or 0), "one_off": float(nv("One-off £") or 0),
+                              "term": int(nv("Term (months)") or 0), "won_by": nv("Rep") or "",
+                              "booked_by": nv("Booked by") or "", "notes": nv("Deal notes") or "",
+                              "won_at": nv("Sold on").isoformat() if nv("Sold on") else d.get("won_at", ""),
+                              "install_date": nv("Install date").isoformat() if nv("Install date") else ""})
+                    if new["Stage"] == "Installed" and not d.get("installed_at"):
+                        d["installed_at"] = d.get("install_date") or today.isoformat()
+                    if new["Stage"] in ("Won", "Installed") and not d.get("won_at"):
+                        d["won_at"] = today.isoformat()
+                    if new["Stage"] != rec.get("status"):
+                        rec["calls"] = calls_of(rec) + [{"at": stamp, "by": crm_user(), "outcome": "Status changed",
+                                                         "notes": f"{rec.get('status')} → {new['Stage']}"}]
+                    rec["status"], rec["deal"] = new["Stage"], d
+                    if nv("Handsets"):
+                        rec["handsets"] = int(nv("Handsets"))
+                    changes[rec["id"]] = rec
+                if changes:
+                    crm_save(changes, f"{len(changes)} deal(s) updated")
+                    ss["sh_flash"] = f"💾 Updated {len(changes)} deal(s)."
+                st.rerun()
+
+    with st.container(key="card-sh-pl3"):
+        section_header("03", "Booked ahead", "Appointments still to happen")
+        ups = sorted(upcoming, key=lambda x: x[0]["at"])
+        if not ups:
+            st.caption("Nothing booked ahead.")
+        else:
+            st.dataframe(pd.DataFrame([{"When": (_when(a["at"]) or now).strftime("%a %d %b %H:%M"), "Company": rec_label(r),
+                                        "Where": " ".join(x for x in (r.get("town"), r.get("postcode")) if x),
+                                        "Type": a.get("kind") or "", "With": a.get("with") or "", "Rep": a.get("rep") or "",
+                                        "Booked by": a.get("booked_by") or "",
+                                        "Handsets": int(to_num(r.get("handsets")) or 0) or None} for a, r in ups]),
+                         hide_index=True, **FULL_WIDTH)
+
+
+# ---------------- 📈 Funnel numbers for the Overview ----------------
+def funnel_stats(recs: List[Dict[str, Any]], start: date) -> Dict[str, Any]:
+    """Booked (by the date it was booked), sat (by appointment date), sold (by sold date), installed (by install date)."""
+    in_p = lambda iso: bool(iso) and (to_date(str(iso)[:10]) or date.min) >= start  # noqa: E731
+    booked, sat, sold, installed, awaiting = [], [], [], [], []
+    for r in recs:
+        for a in appts_of(r):
+            if in_p(a.get("booked_at")):
+                booked.append((a, r))
+            if is_sat(a) and in_p(a.get("at")):
+                sat.append((a, r))
+        d = r.get("deal") or {}
+        if r.get("status") in SOLD and in_p(d.get("won_at")):
+            sold.append(r)
+        if r.get("status") == "Installed" and in_p(d.get("installed_at") or d.get("install_date") or d.get("won_at")):
+            installed.append(r)
+        if r.get("status") == "Won":
+            awaiting.append(r)
+    val = lambda rs: sum(deal_values(r)[3] for r in rs)  # noqa: E731
+    return {"booked": booked, "sat": sat, "sold": sold, "installed": installed, "awaiting": awaiting,
+            "sold_tcv": val(sold), "sold_mrr": sum(deal_values(r)[0] for r in sold), "installed_tcv": val(installed),
+            "awaiting_tcv": val(awaiting), "awaiting_mrr": sum(deal_values(r)[0] for r in awaiting)}
+
+
+def render_funnel(recs: List[Dict[str, Any]], start: date, period: str) -> None:
+    f = funnel_stats(recs, start)
+    nb, ns, nsold = len(f["booked"]), len(f["sat"]), len(f["sold"])
+    sit = f"{ns / nb * 100:.0f}% sit rate" if nb else period.lower()
+    close = f"{nsold / ns * 100:.0f}% of sits" if ns else period.lower()
+    with st.container(key="card-sh-funnel"):
+        section_header("£", "Sales funnel", f"Booked → sat → sold → installed · {period.lower()}")
+        kpis([(f"{nb:,}", "Booked", "appointments made", "#60A5FA"), (f"{ns:,}", "Sat", sit, "#34D399"),
+              (f"{nsold:,}", "Sold", close, "#F0645A"), (money(f["sold_tcv"]), "Sold value", f"{money(f['sold_mrr'])}/month new", "#FBBF24")], 4)
+        kpis([(f"{len(f['awaiting']):,}", "Awaiting install", f"{money(f['awaiting_mrr'])}/month", "#A78BFA"),
+              (money(f["awaiting_tcv"]), "Value to be installed", "sold, not yet in", "#A78BFA"),
+              (f"{len(f['installed']):,}", "Installed", period.lower(), "#34D399"),
+              (money(f["installed_tcv"]), "Installed value", period.lower(), "#34D399")], 4)
+        try:
+            import altair as alt
+            fd = pd.DataFrame([{"Stage": s_, "Count": n, "o": i} for i, (s_, n) in enumerate(
+                [("Booked", nb), ("Sat", ns), ("Sold", nsold), ("Installed", len(f["installed"]))])])
+            ch = (alt.Chart(fd).mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, color="#F0645A")
+                  .encode(y=alt.Y("Stage:N", sort=["Booked", "Sat", "Sold", "Installed"], title=None,
+                                  axis=alt.Axis(labelColor="#E7EAF3")),
+                          x=alt.X("Count:Q", title=None, axis=alt.Axis(labelColor="#8C98B0", gridColor="#1F2A40", tickMinStep=1)),
+                          tooltip=["Stage", "Count"])
+                  .properties(height=150, background="transparent").configure_view(strokeWidth=0))
+            st.altair_chart(ch, **FULL_WIDTH)
+        except Exception:
+            pass
+        t1, t2 = st.columns(2)
+        tele: Dict[str, Dict[str, Any]] = {}
+        for a, r in f["booked"]:
+            tele.setdefault(a.get("booked_by") or "Unknown", {"Booked": 0, "Sat": 0, "Sold": 0, "Sold value £": 0.0})["Booked"] += 1
+        for a, r in f["sat"]:
+            tele.setdefault(a.get("booked_by") or "Unknown", {"Booked": 0, "Sat": 0, "Sold": 0, "Sold value £": 0.0})["Sat"] += 1
+        for r in f["sold"]:
+            p = (r.get("deal") or {}).get("booked_by") or (last_appt(r) or {}).get("booked_by")
+            if p:
+                t = tele.setdefault(p, {"Booked": 0, "Sat": 0, "Sold": 0, "Sold value £": 0.0})
+                t["Sold"] += 1
+                t["Sold value £"] += deal_values(r)[3]
+        reps: Dict[str, Dict[str, Any]] = {}
+        for a, r in f["sat"]:
+            reps.setdefault(a.get("rep") or "Unassigned", {"Sat": 0, "Sold": 0, "Monthly £": 0.0, "Contract value £": 0.0})["Sat"] += 1
+        for r in f["sold"]:
+            p = (r.get("deal") or {}).get("won_by") or "Unassigned"
+            t = reps.setdefault(p, {"Sat": 0, "Sold": 0, "Monthly £": 0.0, "Contract value £": 0.0})
+            t["Sold"] += 1
+            t["Monthly £"] += deal_values(r)[0]
+            t["Contract value £"] += deal_values(r)[3]
+        money_cfg = lambda cols: {c: st.column_config.NumberColumn(c, format="£%.0f") for c in cols}  # noqa: E731
+        with t1:
+            st.markdown("**Telesales**: who booked what")
+            if tele:
+                st.dataframe(pd.DataFrame([{"Telesales": k, **v, "Sit rate": f"{v['Sat'] / v['Booked'] * 100:.0f}%" if v["Booked"] else ""}
+                                           for k, v in sorted(tele.items())]), hide_index=True, **FULL_WIDTH,
+                             column_config=money_cfg(["Sold value £"]))
+            else:
+                st.caption("No appointments booked in this period.")
+        with t2:
+            st.markdown("**Sales reps**: sits and sales")
+            if reps:
+                st.dataframe(pd.DataFrame([{"Rep": k, **v, "Close rate": f"{v['Sold'] / v['Sat'] * 100:.0f}%" if v["Sat"] else ""}
+                                           for k, v in sorted(reps.items())]), hide_index=True, **FULL_WIDTH,
+                             column_config=money_cfg(["Monthly £", "Contract value £"]))
+            else:
+                st.caption("No sits or sales in this period.")
+
+
+# ---------------- 🏛 Companies House check (free, light: 2 calls per firm) ----------------
+CH_BATCH = 100
+
+
+def ch_check_one(rec: Dict[str, Any], key: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Returns (field updates, note). Uses the company number; looks one up by name only if it's missing."""
+    e = LeadEnricher(ch_api_key=key)
+    num = rec.get("company_number")
+    if not num:
+        hit = find_company_by_name(e, rec_label(rec), rec.get("town") or "", rec.get("postcode") or "")
+        num = (hit or {}).get("company_number")
+        if not num:
+            return None, "no match"
+    det = e.get_company_details(num)
+    if not det:
+        return None, "not found"
+    upd: Dict[str, Any] = {"company_number": num, "ch_checked_at": now_uk().isoformat(timespec="seconds")}
+    status = str(det.get("company_status") or "")
+    upd["company_status"] = status.replace("-", " ").capitalize() + (
+        f" ({det['company_status_detail'].replace('-', ' ')})" if det.get("company_status_detail") else "")
+    upd["trading_ok"] = status == "active" and not det.get("company_status_detail")
+    addr = det.get("registered_office_address") or {}
+    reg = ", ".join(x for x in (addr.get("premises"), addr.get("address_line_1"), addr.get("address_line_2"),
+                                addr.get("locality"), addr.get("postal_code")) if x)
+    if reg:
+        upd["reg_address"] = reg
+    if not rec.get("postcode") and addr.get("postal_code"):
+        upd["postcode"] = addr["postal_code"].upper()
+    if not rec.get("town") and addr.get("locality"):
+        upd["town"] = addr["locality"]
+    if not rec.get("address") and addr.get("address_line_1"):
+        upd["address"] = ", ".join(x for x in (addr.get("premises"), addr.get("address_line_1")) if x)
+    if det.get("sic_codes"):
+        upd["sic"] = ", ".join(det["sic_codes"])
+        if not rec.get("sector") or rec.get("sector") == "General Business":
+            upd["sector"] = sector_from_sic(det["sic_codes"]) or rec.get("sector") or "General Business"
+    if det.get("date_of_creation"):
+        upd["incorporated"] = det["date_of_creation"]
+    if det.get("company_name") and _n(det["company_name"]) != _n(rec.get("company") or ""):
+        upd["company"] = tidy_name(det["company_name"])
+        upd["former_name"] = rec.get("company") or ""
+    officers = e.get_officers(num)
+    if officers:
+        names = [display_officer_name(o.name) for o in officers]
+        if not rec.get("contact") or not any(_n(rec["contact"]).startswith(_n(nm)[:6]) or _n(nm).startswith(_n(rec["contact"])[:6])
+                                             for nm in names):
+            dm = pick_decision_maker(officers)
+            if dm:
+                upd["contact"], upd["role"] = display_officer_name(dm.name), format_role(dm.role) if dm.role else "Director"
+                if rec.get("contact"):
+                    upd["former_contact"] = rec["contact"]
+        upd["officers"] = names[:6]
+    tags = list(rec.get("tags") or [])
+    if not upd["trading_ok"] and "Closed at Companies House" not in tags:
+        upd["tags"] = tags + ["Closed at Companies House"]
+    return upd, ("closed" if not upd["trading_ok"] else "ok")
+
+
+def ch_cleanse(rids: List[str]) -> Tuple[int, int, int]:
+    key = ch_api_key if "ch_api_key" in globals() else secret_ch_key
+    if not key:
+        st.session_state["crm_error"] = "Add COMPANIES_HOUSE_KEY to Secrets to check records at Companies House."
+        return 0, 0, 0
+    data = crm_get()
+    cutoff = (now_uk() - timedelta(days=30)).isoformat()
+    todo = [r for r in rids if r in data and str(data[r].get("ch_checked_at") or "") < cutoff][:CH_BATCH]
+    if not todo:
+        return 0, 0, 0
+    bar = st.progress(0.0, text="Checking Companies House…")
+    results: Dict[str, Dict[str, Any]] = {}
+    closed = fails = 0
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = {pool.submit(ch_check_one, dict(data[r]), key): r for r in todo}
+        for n_, fut in enumerate(as_completed(futs), start=1):
+            rid = futs[fut]
+            try:
+                upd, note = fut.result()
+            except Exception:
+                upd, note = None, "error"
+            if upd:
+                results[rid] = upd
+                closed += note == "closed"
+            else:
+                fails += 1
+                results[rid] = {"ch_checked_at": now_uk().isoformat(timespec="seconds")}
+            bar.progress(n_ / len(todo), text=f"Checked {n_} of {len(todo)} · {rec_label(data[rid])}")
+    bar.empty()
+    latest = crm_get()
+    changes = {rid: {**latest[rid], **upd} for rid, upd in results.items() if rid in latest}
+    if changes:
+        crm_save(changes, f"Companies House check: {len(changes)}")
+    return len(todo) - fails, closed, fails
+
+
 def dispatch_sales_hub_views() -> None:
     view = st.session_state.get("view")
-    if view not in ("customers", "caller", "local", "overview"):
+    pages = {"customers": render_customers_page, "caller": render_caller_page, "callbacks": render_callbacks_page,
+             "pipeline": render_pipeline_page, "local": render_local_page, "overview": render_overview_page}
+    if view not in pages:
         return
     render_html(SH_CSS + CALL_CSS)
-    {"customers": render_customers_page, "caller": render_caller_page, "local": render_local_page,
-     "overview": render_overview_page}[view]()
+    pages[view]()
     data = crm_get()
     today = now_uk().date()
     due = sum(1 for r in data.values() if isinstance(r, dict) and (r.get("status") or "New") not in CLOSED
@@ -8224,7 +9771,7 @@ def dispatch_sales_hub_views() -> None:
     render_html('<div class="pe-stats">'
                 f'<div class="pe-stat"><div class="v">{len(data):,}</div><div class="l">Customers</div></div>'
                 f'<div class="pe-stat"><div class="v">{due:,}</div><div class="l">Due a call</div></div>'
-                f'<div class="pe-stat"><div class="v">{sum(1 for r in data.values() if isinstance(r, dict) and r.get("status") == "Won"):,}</div><div class="l">Won</div></div>'
+                f'<div class="pe-stat"><div class="v">{sum(1 for r in data.values() if isinstance(r, dict) and r.get("status") in SOLD):,}</div><div class="l">Sold</div></div>'
                 "</div>", target=sidebar_stats_slot)
     st.stop()
 
