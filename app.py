@@ -6396,8 +6396,8 @@ def render_activity_page(title_html: str, colour: str, events: List[Dict[str, An
         section_header("01", "Emails per day", "Last 14 days. Hover a bar for the number.")
         start = today - timedelta(days=13)
         em = df[em_mask].copy()
-        em["Day"] = em["When"].apply(lambda d: d.date() if d else None)
-        counts = em[em["Day"].apply(lambda d: bool(d) and d >= start)].groupby("Day").size()
+        days = [d.date() for d in em["When"] if d is not None and pd.notna(d)] if len(em) else []
+        counts = pd.Series([d for d in days if d and d >= start], dtype=object).value_counts()
         daily = pd.DataFrame({"Day": [start + timedelta(days=i) for i in range(14)]})
         daily["Emails"] = daily["Day"].map(counts).fillna(0).astype(int)
         daily["Label"] = pd.to_datetime(daily["Day"]).dt.strftime("%a %d")
