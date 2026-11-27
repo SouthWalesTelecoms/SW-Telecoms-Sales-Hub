@@ -8417,9 +8417,9 @@ def render_caller_page() -> None:
              (str(appts_today), "Booked today", "done")], f"Calling as {crm_user()}")
     flash()
     show_crm_error()
-    later = sorted((r.get("next_time"), r) for r in data.values() if isinstance(r, dict) and r.get("next_time")
+    later = sorted(((r.get("next_time"), r) for r in data.values() if isinstance(r, dict) and r.get("next_time")
                    and to_date(r.get("next_action")) == today and not due_now(r, now_)
-                   and (r.get("status") or "New") not in CLOSED)
+                   and (r.get("status") or "New") not in CLOSED), key=lambda x: str(x[0]))  # key: two equal times can't compare records
     if later:
         t_, r_ = later[0]
         st.caption(f"⏰ Next timed call-back: **{t_}** {esc(rec_label(r_))}"
